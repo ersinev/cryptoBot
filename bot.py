@@ -29,6 +29,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from indicators import fibonacci_bollinger
+from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
     EMA_PERIOD,
     ENTRY_VOL_LIMIT,
@@ -165,11 +166,13 @@ class FBBInstantBreakoutBot:
         await self.warmup_all()
         log.info(
             "Config: %s USDT/trade | 1m instant red break | "
-            "exit entry-candle-low / EMA%d 5m then 1m-close +%.0f%% trail -%.0f%%",
+            "exit entry-candle-low / EMA%d 5m then 1m-close +%.0f%% trail -%.0f%% | "
+            "telegram=%s",
             ORDER_USDT,
             EMA_PERIOD,
             TRAIL_ACTIVATE_PCT,
             TRAIL_PCT,
+            "ON" if telegram_enabled() else "OFF",
         )
 
         tasks = [
@@ -754,6 +757,14 @@ class FBBInstantBreakoutBot:
                 notional,
                 len(self.positions),
             )
+            await notify_buy(
+                symbol,
+                price=fill,
+                qty=filled,
+                notional=notional,
+                stop_low=entry_candle_low,
+                order_id=str(order.get("id") or ""),
+            )
             return True
         except Exception as exc:  # noqa: BLE001
             log.error("Market buy failed %s: %s", symbol, exc)
@@ -804,12 +815,16 @@ class FBBInstantBreakoutBot:
                 self._release_symbol(pos.symbol, keep_broke_red=same_candle)
                 return
 
+            entry = pos.entry_price
             order = await self.exchange.create_order(
                 pos.symbol,
                 "market",
                 "sell",
                 amount,
                 params={"reduceOnly": True},
+            )
+            exit_px = float(
+                order.get("average") or order.get("price") or entry
             )
             log.info(
                 "ORDER SELL | %s | reason=%s | orderId=%s | qty=%s | reduceOnly | "
@@ -819,6 +834,14 @@ class FBBInstantBreakoutBot:
                 order.get("id"),
                 amount,
                 len(self.positions) - 1,
+            )
+            await notify_sell(
+                pos.symbol,
+                reason=reason or "close",
+                entry=entry,
+                exit_price=exit_px,
+                qty=amount,
+                order_id=str(order.get("id") or ""),
             )
             self._release_symbol(pos.symbol, keep_broke_red=same_candle)
         except Exception as exc:  # noqa: BLE001
