@@ -29,8 +29,7 @@ from strategy import (
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     ORDER_USDT,
-    PARTIAL_TP_FRAC,
-    PARTIAL_TP_PCT,
+    PARTIAL_LADDER,
     TIMEFRAME,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
@@ -42,7 +41,8 @@ from strategy import (
     entry_candle_stop_hit,
     entry_fill_price,
     five_m_just_closed,
-    partial_tp_hit,
+    ladder_label,
+    next_ladder_partial,
     prev_candle_quote_ok,
     trail_should_arm,
     trail_stop_hit,
@@ -197,7 +197,7 @@ def run_backtest(
     entry_candle_low = 0.0
     high_water = 0.0
     trail_armed = False
-    partial_taken = False
+    ladder_done = [False] * len(PARTIAL_LADDER)
     realized_pnl = 0.0
     realized_fees = 0.0
     armed = False
@@ -254,21 +254,18 @@ def run_backtest(
     if verbose:
         print(f"\nRunning backtest on {n} closed 1m candles...\n")
         print(
-            f"Entry: armed persist + FBB 0.786 break | "
+            f"Entry: armed persist + FBB 0.786 wick break | "
             f"prev 1m vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | candle >= {MIN_CANDLE_PCT}%\n"
         )
-        partial_txt = (
-            f"partial {PARTIAL_TP_FRAC*100:.0f}% @ +{PARTIAL_TP_PCT:.0f}% + "
-            if PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0
-            else ""
-        )
+        partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
         trail_txt = (
             f"then +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
             if USE_TRAIL
             else "no trail"
         )
         print(
-            f"Exit: entry-candle-low | {partial_txt}EMA{EMA_PERIOD} {EMA_EXIT_TF} ({trail_txt})\n"
+            f"Exit: entry-candle-low | {partial_txt}EMA{EMA_PERIOD} {EMA_EXIT_TF} "
+            f"until trail ({trail_txt})\n"
         )
         print("-" * 72)
 
@@ -285,22 +282,25 @@ def run_backtest(
         if in_pos:
             high_water = max(high_water, h)
 
-            hit_tp, tp_px = partial_tp_hit(
-                entry_price, high_water, taken=partial_taken
-            )
-            if hit_tp and rem_qty > 0:
-                sell_q = min(qty * PARTIAL_TP_FRAC, rem_qty)
+            # Ladder partials (can fire multiple steps on same bar)
+            while rem_qty > 0:
+                hit_tp, tp_px, frac, step_i = next_ladder_partial(
+                    entry_price, high_water, ladder_done
+                )
+                if not hit_tp:
+                    break
+                sell_q = min(qty * frac, rem_qty)
                 pnl, fees = _sell_qty(sell_q, tp_px)
                 realized_pnl += pnl
                 realized_fees += fees
                 rem_qty -= sell_q
-                partial_taken = True
+                ladder_done[step_i] = True
+                pct_lvl = PARTIAL_LADDER[step_i][0]
                 if verbose:
                     print(
                         f"PART #{len(trades)+1:03d} | {ms_to_str(ts)} | "
-                        f"price={tp_px:.8f} | partial +{PARTIAL_TP_PCT:.0f}% | "
-                        f"sold {PARTIAL_TP_FRAC*100:.0f}% | "
-                        f"leg={pnl:+.4f} USDT"
+                        f"price={tp_px:.8f} | ladder +{pct_lvl:g}% | "
+                        f"sold {frac*100:.0f}% init | leg={pnl:+.4f} USDT"
                     )
 
             if USE_TRAIL and trail_should_arm(entry_price, high_water):
@@ -316,8 +316,9 @@ def run_backtest(
 
             hit, fill = entry_candle_stop_hit(entry_candle_low, l)
             if hit:
+                any_part = any(ladder_done)
                 reason = (
-                    "entry candle low (runner)" if partial_taken else "entry candle low"
+                    "entry candle low (runner)" if any_part else "entry candle low"
                 )
                 _close_pos(ts, fill, reason)
                 continue
@@ -328,7 +329,7 @@ def run_backtest(
                     ohlcv[: i + 1]
                 )
                 if should_exit:
-                    if partial_taken:
+                    if any(ladder_done):
                         reason = f"EMA runner | {reason}"
                     _close_pos(ts, bar_close, reason)
                     continue
@@ -376,7 +377,7 @@ def run_backtest(
         entry_candle_low = l
         high_water = fill
         trail_armed = False
-        partial_taken = False
+        ladder_done = [False] * len(PARTIAL_LADDER)
         realized_pnl = 0.0
         realized_fees = 0.0
         entry_vol_ratio = quote_vol
@@ -436,7 +437,7 @@ def print_symbol_summary(
     print("Armed       : grey dip persists until FBB 0.786 break")
     print(
         f"Exit        : entry-candle-low | "
-        f"{'partial '+str(int(PARTIAL_TP_FRAC*100))+'%@+'+str(int(PARTIAL_TP_PCT))+'% + ' if PARTIAL_TP_PCT>0 else ''}"
+        f"{(ladder_label() + ' + ') if PARTIAL_LADDER else ''}"
         f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
         f"{'' if not USE_TRAIL else f' / +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%'}"
     )
@@ -663,11 +664,7 @@ async def main() -> None:
                 f"Universe: {len(symbols)} / {total_uni} spot USDT pairs "
                 f"(first {UNIVERSE_LIMIT or 'all'}, sorted A-Z, no 24h filter)"
             )
-        partial_bit = (
-            f"partial {PARTIAL_TP_FRAC*100:.0f}%@{PARTIAL_TP_PCT:.0f}% + "
-            if PARTIAL_TP_PCT > 0
-            else ""
-        )
+        partial_bit = (ladder_label() + " + ") if PARTIAL_LADDER else ""
         trail_bit = (
             f" / +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
             if USE_TRAIL

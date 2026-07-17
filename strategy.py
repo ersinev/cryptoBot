@@ -18,8 +18,6 @@ TIMEFRAME = "1m"
 TIMEFRAME_MS = 60 * 1000
 FBB_LENGTH = 200
 FBB_MULT = 3.0
-EXIT_TIMEFRAME = "5m"
-EXIT_TF_MS = 5 * 60 * 1000
 EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
@@ -29,16 +27,49 @@ VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "2.5"))
-TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
+TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "10.0"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
-# Hybrid: sell PARTIAL_TP_FRAC at +PARTIAL_TP_PCT%, remainder rides EMA (trail optional)
-PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))  # 0 = disabled
-PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.5"))
-USE_TRAIL = os.getenv("USE_TRAIL", "0").strip().lower() in ("1", "true", "yes")
-# Runner EMA timeframe: "1m" or "5m"
-EMA_EXIT_TF = os.getenv("EMA_EXIT_TF", "1m").strip().lower()
-if EMA_EXIT_TF not in ("1m", "5m"):
-    EMA_EXIT_TF = "1m"
+# Legacy single-step (unused if PARTIAL_LADDER set)
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))
+PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.3"))
+USE_TRAIL = os.getenv("USE_TRAIL", "1").strip().lower() in ("1", "true", "yes")
+# Runner EMA timeframe: "1m", "3m", or "5m"
+_EMA_TF_MS = {"1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000}
+EMA_EXIT_TF = os.getenv("EMA_EXIT_TF", "5m").strip().lower()
+if EMA_EXIT_TF not in _EMA_TF_MS:
+    EMA_EXIT_TF = "5m"
+EMA_EXIT_TF_MS = _EMA_TF_MS[EMA_EXIT_TF]
+EXIT_TIMEFRAME = EMA_EXIT_TF
+EXIT_TF_MS = EMA_EXIT_TF_MS
+
+
+def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
+    """Parse '3:0.30,5:0.30' → [(3.0, 0.30), (5.0, 0.30)] (pct, frac of initial)."""
+    out: list[tuple[float, float]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        a, b = part.split(":", 1)
+        pct, frac = float(a.strip()), float(b.strip())
+        if pct > 0 and frac > 0:
+            out.append((pct, frac))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+PARTIAL_LADDER = _parse_partial_ladder(
+    os.getenv("PARTIAL_LADDER", "3:0.30,5:0.30")
+)
+if not PARTIAL_LADDER and PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0:
+    PARTIAL_LADDER = [(PARTIAL_TP_PCT, PARTIAL_TP_FRAC)]
+
+
+def ladder_label() -> str:
+    if not PARTIAL_LADDER:
+        return ""
+    bits = [f"{int(f*100)}%@+{p:g}%" for p, f in PARTIAL_LADDER]
+    return " then ".join(bits)
 
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
@@ -74,12 +105,20 @@ def aggregate_ohlcv(ohlcv: list[list[float]], bucket_ms: int) -> list[list[float
     return out
 
 
-def five_m_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
+def ema_tf_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
+    """True when the current 1m bar is the last bar of an EMA_EXIT_TF bucket."""
+    if EMA_EXIT_TF == "1m":
+        return True
     ts = int(ohlcv[idx][0])
     if idx + 1 >= len(ohlcv):
         return True
     next_ts = int(ohlcv[idx + 1][0])
-    return (ts // EXIT_TF_MS) != (next_ts // EXIT_TF_MS)
+    return (ts // EMA_EXIT_TF_MS) != (next_ts // EMA_EXIT_TF_MS)
+
+
+def five_m_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
+    """Alias — bucket size follows EMA_EXIT_TF (1m/3m/5m)."""
+    return ema_tf_just_closed(ohlcv, idx)
 
 
 def update_armed(armed: bool, o: float, l: float, grey: float) -> bool:
@@ -89,7 +128,7 @@ def update_armed(armed: bool, o: float, l: float, grey: float) -> bool:
 
 
 def broke_entry_line(h: float, entry_line: float) -> bool:
-    """Break of FBB upper 0.786 (one band below red 1.000)."""
+    """Break of FBB upper 0.786 (wick / high touch)."""
     return h > entry_line
 
 
@@ -178,10 +217,32 @@ def trail_should_arm(entry: float, high_water: float) -> bool:
     return high_water >= entry * (1.0 + TRAIL_ACTIVATE_PCT / 100.0)
 
 
+def next_ladder_partial(
+    entry: float,
+    high_water: float,
+    done: list[bool],
+) -> tuple[bool, float, float, int]:
+    """
+    Next unmet ladder step if high touched its %.
+    Returns (hit, fill_px, frac_of_initial, step_index).
+    """
+    if entry <= 0 or high_water <= 0 or not PARTIAL_LADDER:
+        return False, 0.0, 0.0, -1
+    if len(done) < len(PARTIAL_LADDER):
+        done = done + [False] * (len(PARTIAL_LADDER) - len(done))
+    for i, (pct, frac) in enumerate(PARTIAL_LADDER):
+        if done[i]:
+            continue
+        tp = entry * (1.0 + pct / 100.0)
+        if high_water >= tp:
+            return True, tp, frac, i
+    return False, 0.0, 0.0, -1
+
+
 def partial_tp_hit(
     entry: float, high_water: float, *, taken: bool
 ) -> tuple[bool, float]:
-    """First scale-out when high touches +PARTIAL_TP_PCT%. Returns (hit, fill_px)."""
+    """Legacy single-step helper."""
     if taken or PARTIAL_TP_PCT <= 0 or PARTIAL_TP_FRAC <= 0 or entry <= 0:
         return False, 0.0
     tp = entry * (1.0 + PARTIAL_TP_PCT / 100.0)
@@ -213,19 +274,19 @@ def ema_exit_signal(
         ema = ema_series(closes, EMA_PERIOD)
         bar_close = float(closes[-1])
         ema_val = float(ema[-1])
-        tf_label = "1m"
     else:
-        bars = aggregate_ohlcv(ohlcv_1m, EXIT_TF_MS)
+        bars = aggregate_ohlcv(ohlcv_1m, EMA_EXIT_TF_MS)
         if len(bars) < EMA_PERIOD:
             return False, 0.0, 0.0, ""
         closes = np.asarray([float(b[4]) for b in bars], dtype=float)
         ema = ema_series(closes, EMA_PERIOD)
         bar_close = float(bars[-1][4])
         ema_val = float(ema[-1])
-        tf_label = "5m"
     if bar_close >= ema_val:
         return False, bar_close, ema_val, ""
-    reason = f"EMA{EMA_PERIOD} {tf_label} close {bar_close:.8f} < {ema_val:.8f}"
+    reason = (
+        f"EMA{EMA_PERIOD} {EMA_EXIT_TF} close {bar_close:.8f} < {ema_val:.8f}"
+    )
     return True, bar_close, ema_val, reason
 
 

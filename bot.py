@@ -3,14 +3,15 @@ Fibonacci Bollinger Instant Breakout — Binance Spot
 
 Entry (1m, instant on FBB 0.786 break — one band below red):
   1) Grey dip arms (persists across candles until entry)
-  2) Price breaks FBB upper 0.786
+  2) Price breaks FBB upper 0.786 (wick/high)
   3) Previous closed 1m quote vol >= MIN_CANDLE_QUOTE_VOL (no rel filter)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
 Exit:
   - Stop: entry 1m candle low (structure)
-  - Scale-out: PARTIAL_TP_FRAC at +PARTIAL_TP_PCT% (default 50% @ +3%)
-  - Runner: 1m close below EMA9 (EMA_EXIT_TF=1m; trail only if USE_TRAIL=1)
+  - Ladder: PARTIAL_LADDER e.g. 30%@+3% then 30%@+5%
+  - Until +TRAIL_ACTIVATE_PCT%: EMA9 on EMA_EXIT_TF (default 5m)
+  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high (default +10% / -3%)
 """
 from __future__ import annotations
 
@@ -41,8 +42,7 @@ from strategy import (
     MIN_CANDLE_QUOTE_VOL,
     OHLCV_LIMIT,
     ORDER_USDT,
-    PARTIAL_TP_FRAC,
-    PARTIAL_TP_PCT,
+    PARTIAL_LADDER,
     TIMEFRAME,
     TIMEFRAME_MS,
     TRAIL_ACTIVATE_PCT,
@@ -53,8 +53,9 @@ from strategy import (
     entry_candle_stop_hit,
     entry_rules_met,
     five_m_just_closed,
+    ladder_label,
+    next_ladder_partial,
     ohlcv_with_active,
-    partial_tp_hit,
     trail_should_arm,
     trail_stop_hit,
     prev_candle_quote_ok,
@@ -110,8 +111,8 @@ class Position:
     trail_armed: bool = False
     entry_candle_ts: int = 0
     close_pending: bool = False
-    partial_taken: bool = False
     initial_amount: float = 0.0
+    ladder_done: list[bool] = field(default_factory=list)
 
 
 class FBBInstantBreakoutBot:
@@ -175,11 +176,7 @@ class FBBInstantBreakoutBot:
             if USE_TRAIL
             else "no trail"
         )
-        partial_txt = (
-            f"partial {PARTIAL_TP_FRAC*100:.0f}%@{PARTIAL_TP_PCT:.0f}% + "
-            if PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0
-            else ""
-        )
+        partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
             "exit entry-candle-low / %sEMA%d %s (%s) | telegram=%s",
@@ -417,13 +414,15 @@ class FBBInstantBreakoutBot:
 
             border_ts = (int(time.time() * 1000) // TIMEFRAME_MS) * TIMEFRAME_MS
             prev_border = border_ts - TIMEFRAME_MS
-            five_m_closed = (prev_border // EXIT_TF_MS) != (border_ts // EXIT_TF_MS)
+            ema_bucket_closed = (prev_border // EXIT_TF_MS) != (
+                border_ts // EXIT_TF_MS
+            )
 
             for sym in list(self.positions.keys()):
                 await self._fetch_and_apply_ohlcv(sym)
 
-            # EMA runner: every 1m close, or only on 5m close if EMA_EXIT_TF=5m
-            check_ema = EMA_EXIT_TF == "1m" or five_m_closed
+            # EMA runner: every 1m close, or on 3m/5m bucket close
+            check_ema = EMA_EXIT_TF == "1m" or ema_bucket_closed
             if check_ema and self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
@@ -511,13 +510,10 @@ class FBBInstantBreakoutBot:
 
         candle_pct = candle_up_pct(state.open, state.high)
 
-        # Previous CLOSED 1m only (already in state.ohlcv) — no REST, no rel
         if not state.ohlcv:
             return
         prev = state.ohlcv[-1]
-        prev_base = float(prev[5])
-        prev_close = float(prev[4])
-        vol_ok, quote_vol = prev_candle_quote_ok(prev_base, prev_close)
+        vol_ok, quote_vol = prev_candle_quote_ok(float(prev[5]), float(prev[4]))
         if not vol_ok:
             log.debug(
                 "WAIT PREV VOL %s | prev 1m quote %.0f (min %.0f)",
@@ -569,7 +565,7 @@ class FBBInstantBreakoutBot:
 
         # Closed 1m bars only (no active wick) for EMA decision
         series = state.ohlcv
-        if EMA_EXIT_TF == "5m":
+        if EMA_EXIT_TF in ("3m", "5m"):
             series = ohlcv_with_active(
                 state.ohlcv,
                 state.candle_ts,
@@ -624,32 +620,38 @@ class FBBInstantBreakoutBot:
             return
 
         pos.high_since_entry = max(pos.high_since_entry, price)
+        if len(pos.ladder_done) < len(PARTIAL_LADDER):
+            pos.ladder_done = pos.ladder_done + [False] * (
+                len(PARTIAL_LADDER) - len(pos.ladder_done)
+            )
 
-        # Scale-out first (50% @ +PARTIAL_TP_PCT)
-        hit_tp, tp_px = partial_tp_hit(
-            pos.entry_price, pos.high_since_entry, taken=pos.partial_taken
+        # Ladder scale-outs (one step per call; next tick can fire next step)
+        hit_tp, tp_px, frac, step_i = next_ladder_partial(
+            pos.entry_price, pos.high_since_entry, pos.ladder_done
         )
-        if hit_tp:
+        if hit_tp and step_i >= 0:
             pos.close_pending = True
             async with self._trade_lock:
                 if symbol not in self.positions:
                     return
                 cur = self.positions[symbol]
-                if cur.partial_taken:
+                if cur.ladder_done[step_i]:
                     cur.close_pending = False
                     return
+                pct_lvl = PARTIAL_LADDER[step_i][0]
                 log.info(
-                    "PARTIAL TP %s | +%.0f%% touch | sell %.0f%% @~%.6f | entry=%.6f",
+                    "LADDER TP %s | +%g%% touch | sell %.0f%% init @~%.6f | entry=%.6f",
                     symbol,
-                    PARTIAL_TP_PCT,
-                    PARTIAL_TP_FRAC * 100,
+                    pct_lvl,
+                    frac * 100,
                     tp_px,
                     cur.entry_price,
                 )
                 ok = await self._market_sell_partial(
                     symbol,
-                    PARTIAL_TP_FRAC,
-                    reason=f"partial +{PARTIAL_TP_PCT:.0f}%",
+                    frac,
+                    reason=f"ladder +{pct_lvl:g}%",
+                    step_i=step_i,
                 )
                 if not ok:
                     cur = self.positions.get(symbol)
@@ -744,8 +746,8 @@ class FBBInstantBreakoutBot:
                 high_since_entry=fill,
                 trail_armed=False,
                 entry_candle_ts=entry_candle_ts,
-                partial_taken=False,
                 initial_amount=filled,
+                ladder_done=[False] * len(PARTIAL_LADDER),
             )
             self.held_symbols.add(symbol)
             log.info(
@@ -788,9 +790,14 @@ class FBBInstantBreakoutBot:
         )
 
     async def _market_sell_partial(
-        self, symbol: str, frac: float, reason: str
+        self,
+        symbol: str,
+        frac: float,
+        reason: str,
+        *,
+        step_i: int = -1,
     ) -> bool:
-        """Sell a fraction of the open position; keep runner unlocked for EMA/stop."""
+        """Sell frac of initial size; keep runner for EMA/trail."""
         pos = self.positions.get(symbol)
         if pos is None or frac <= 0 or frac >= 1:
             if pos is not None:
@@ -826,10 +833,11 @@ class FBBInstantBreakoutBot:
             )
             exit_px = float(order.get("average") or order.get("price") or entry)
             pos.amount = max(0.0, pos.amount - sell_amt)
-            pos.partial_taken = True
+            if 0 <= step_i < len(pos.ladder_done):
+                pos.ladder_done[step_i] = True
             pos.close_pending = False
             log.info(
-                "ORDER PARTIAL SELL | %s | reason=%s | qty=%s | left=%s | avg=%.6f",
+                "ORDER LADDER SELL | %s | reason=%s | qty=%s | left=%s | avg=%.6f",
                 symbol,
                 reason,
                 sell_amt,
@@ -844,7 +852,6 @@ class FBBInstantBreakoutBot:
                 qty=sell_amt,
                 order_id=str(order.get("id") or ""),
             )
-            # If dust left, close fully
             min_amt = (
                 (self.exchange.market(symbol).get("limits") or {})
                 .get("amount", {})
