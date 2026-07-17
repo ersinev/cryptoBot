@@ -28,9 +28,13 @@ MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "3.0"))
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "4.0"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
+# Hybrid: sell PARTIAL_TP_FRAC at +PARTIAL_TP_PCT%, remainder rides EMA (trail optional)
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "5.0"))  # 0 = disabled
+PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.5"))
+USE_TRAIL = os.getenv("USE_TRAIL", "0").strip().lower() in ("1", "true", "yes")
 
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
@@ -106,7 +110,7 @@ def volume_ok(
     close_price: float,
     closed_base_volumes: list[float],
 ) -> tuple[bool, float, float]:
-    """Match backtest: quote_vol = base_vol * close."""
+    """Legacy: abs + rel. Prefer prev_candle_quote_ok for live entry."""
     quote_vol = base_vol * max(close_price, 0.0)
     if quote_vol < MIN_CANDLE_QUOTE_VOL:
         return False, quote_vol, 0.0
@@ -117,6 +121,12 @@ def volume_ok(
         return False, quote_vol, 0.0
     rel = base_vol / avg
     return rel >= VOL_MULT, quote_vol, rel
+
+
+def prev_candle_quote_ok(base_vol: float, close_price: float) -> tuple[bool, float]:
+    """Previous closed 1m quote vol only (>= MIN_CANDLE_QUOTE_VOL). No rel filter."""
+    quote_vol = base_vol * max(close_price, 0.0)
+    return quote_vol >= MIN_CANDLE_QUOTE_VOL, quote_vol
 
 
 def entry_rules_met(armed: bool, high: float, open_: float, entry_line: float) -> bool:
@@ -157,9 +167,23 @@ def entry_candle_stop_hit(entry_candle_low: float, price: float) -> tuple[bool, 
 
 def trail_should_arm(entry: float, high_water: float) -> bool:
     """Arm trail when price has traded +TRAIL_ACTIVATE_PCT% above entry (intrabar OK)."""
+    if not USE_TRAIL:
+        return False
     if entry <= 0 or high_water <= 0:
         return False
     return high_water >= entry * (1.0 + TRAIL_ACTIVATE_PCT / 100.0)
+
+
+def partial_tp_hit(
+    entry: float, high_water: float, *, taken: bool
+) -> tuple[bool, float]:
+    """First scale-out when high touches +PARTIAL_TP_PCT%. Returns (hit, fill_px)."""
+    if taken or PARTIAL_TP_PCT <= 0 or PARTIAL_TP_FRAC <= 0 or entry <= 0:
+        return False, 0.0
+    tp = entry * (1.0 + PARTIAL_TP_PCT / 100.0)
+    if high_water < tp:
+        return False, 0.0
+    return True, tp
 
 
 def trail_stop_hit(

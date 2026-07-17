@@ -28,22 +28,24 @@ from strategy import (
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     ORDER_USDT,
+    PARTIAL_TP_FRAC,
+    PARTIAL_TP_PCT,
     TIMEFRAME,
-    VOL_LOOKBACK,
-    VOL_MULT,
-    aggregate_ohlcv,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
+    USE_TRAIL,
+    aggregate_ohlcv,
     broke_entry_line,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_fill_price,
     five_m_just_closed,
+    partial_tp_hit,
+    prev_candle_quote_ok,
     trail_should_arm,
     trail_stop_hit,
     update_armed,
-    volume_ok,
 )
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -51,7 +53,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 API_SECRET = os.getenv("BINANCE_SECRET", "").strip()
 
-LOOKBACK_DAYS = 7
+LOOKBACK_DAYS = 5
 
 # Manual test symbols (empty → gainer list or full universe)
 SYMBOLS: list[str] = [
@@ -188,26 +190,38 @@ def run_backtest(
     entry_price = 0.0
     entry_time = 0
     qty = 0.0
+    rem_qty = 0.0
     entry_vol_ratio = 0.0
     entry_candle_pct = 0.0
     entry_candle_low = 0.0
     high_water = 0.0
     trail_armed = False
+    partial_taken = False
+    realized_pnl = 0.0
+    realized_fees = 0.0
     armed = False
     skipped_vol = 0
     n = len(ohlcv)
     # Funnel counters (why setups die)
     cnt_armed_break = 0
     cnt_fail_vol_abs = 0
-    cnt_fail_vol_rel = 0
     cnt_fail_pct = 0
     cnt_pass = 0
 
+    def _sell_qty(sell_q: float, exit_px: float) -> tuple[float, float]:
+        buy_fee = sell_q * entry_price * FEE_RATE
+        sell_fee = sell_q * exit_px * FEE_RATE
+        pnl = sell_q * (exit_px - entry_price) - buy_fee - sell_fee
+        return pnl, buy_fee + sell_fee
+
     def _close_pos(exit_ts: int, exit_px: float, reason: str) -> None:
-        nonlocal in_pos, armed
-        fee = qty * entry_price * FEE_RATE + qty * exit_px * FEE_RATE
-        pnl = qty * (exit_px - entry_price) - fee
-        pnl_pct = (exit_px / entry_price - 1.0) * 100.0
+        nonlocal in_pos, armed, rem_qty, realized_pnl, realized_fees
+        if rem_qty > 0:
+            pnl, fees = _sell_qty(rem_qty, exit_px)
+            realized_pnl += pnl
+            realized_fees += fees
+            rem_qty = 0.0
+        pnl_pct = (exit_px / entry_price - 1.0) * 100.0 if entry_price else 0.0
         trades.append(
             Trade(
                 symbol=symbol,
@@ -216,33 +230,44 @@ def run_backtest(
                 exit_time=exit_ts,
                 exit_price=exit_px,
                 qty=qty,
-                pnl_usdt=pnl,
-                pnl_pct=pnl_pct,
-                fees=fee,
+                pnl_usdt=realized_pnl,
+                pnl_pct=(realized_pnl / ORDER_USDT) * 100.0 if ORDER_USDT else pnl_pct,
+                fees=realized_fees,
                 exit_reason=reason,
                 vol_ratio=entry_vol_ratio,
                 candle_pct=entry_candle_pct,
             )
         )
         if verbose:
-            sign = "+" if pnl >= 0 else ""
+            sign = "+" if realized_pnl >= 0 else ""
             print(
                 f"SELL #{len(trades):03d} | {ms_to_str(exit_ts)} | "
                 f"price={exit_px:.8f} | {reason} | "
-                f"PnL={sign}{pnl:.4f} USDT ({sign}{pnl_pct:.2f}%)"
+                f"PnL={sign}{realized_pnl:.4f} USDT ({sign}{pnl_pct:.2f}%)"
             )
         in_pos = False
         armed = False
+        realized_pnl = 0.0
+        realized_fees = 0.0
 
     if verbose:
         print(f"\nRunning backtest on {n} closed 1m candles...\n")
         print(
-            f"Entry: armed persist + FBB 0.786 break | vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | "
-            f"rel >= {VOL_MULT}x | candle >= {MIN_CANDLE_PCT}%\n"
+            f"Entry: armed persist + FBB 0.786 break | "
+            f"prev 1m vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | candle >= {MIN_CANDLE_PCT}%\n"
+        )
+        partial_txt = (
+            f"partial {PARTIAL_TP_FRAC*100:.0f}% @ +{PARTIAL_TP_PCT:.0f}% + "
+            if PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0
+            else ""
+        )
+        trail_txt = (
+            f"then +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
+            if USE_TRAIL
+            else "no trail"
         )
         print(
-            f"Exit: entry-candle-low | EMA{EMA_PERIOD} 5m until +{TRAIL_ACTIVATE_PCT:.0f}% "
-            f"(intrabar) | then trail -{TRAIL_PCT:.0f}% (floor=entry)\n"
+            f"Exit: entry-candle-low | {partial_txt}EMA{EMA_PERIOD} 5m ({trail_txt})\n"
         )
         print("-" * 72)
 
@@ -258,19 +283,42 @@ def run_backtest(
 
         if in_pos:
             high_water = max(high_water, h)
-            # Arm on intrabar high (+activate%), then trail can fire on same bar low
-            if trail_should_arm(entry_price, high_water):
+
+            hit_tp, tp_px = partial_tp_hit(
+                entry_price, high_water, taken=partial_taken
+            )
+            if hit_tp and rem_qty > 0:
+                sell_q = min(qty * PARTIAL_TP_FRAC, rem_qty)
+                pnl, fees = _sell_qty(sell_q, tp_px)
+                realized_pnl += pnl
+                realized_fees += fees
+                rem_qty -= sell_q
+                partial_taken = True
+                if verbose:
+                    print(
+                        f"PART #{len(trades)+1:03d} | {ms_to_str(ts)} | "
+                        f"price={tp_px:.8f} | partial +{PARTIAL_TP_PCT:.0f}% | "
+                        f"sold {PARTIAL_TP_FRAC*100:.0f}% | "
+                        f"leg={pnl:+.4f} USDT"
+                    )
+
+            if USE_TRAIL and trail_should_arm(entry_price, high_water):
                 trail_armed = True
 
-            hit, fill = trail_stop_hit(
-                entry_price, high_water, l, armed=trail_armed
-            )
-            if hit:
-                _close_pos(ts, fill, f"trail -{TRAIL_PCT}%")
-                continue
+            if USE_TRAIL:
+                hit, fill = trail_stop_hit(
+                    entry_price, high_water, l, armed=trail_armed
+                )
+                if hit:
+                    _close_pos(ts, fill, f"trail -{TRAIL_PCT}%")
+                    continue
+
             hit, fill = entry_candle_stop_hit(entry_candle_low, l)
             if hit:
-                _close_pos(ts, fill, "entry candle low")
+                reason = (
+                    "entry candle low (runner)" if partial_taken else "entry candle low"
+                )
+                _close_pos(ts, fill, reason)
                 continue
 
             if not trail_armed and five_m_just_closed(ohlcv, i):
@@ -278,6 +326,8 @@ def run_backtest(
                     ohlcv[: i + 1]
                 )
                 if should_exit:
+                    if partial_taken:
+                        reason = f"EMA runner | {reason}"
                     _close_pos(ts, bar_close, reason)
                     continue
 
@@ -290,6 +340,7 @@ def run_backtest(
             continue
 
         if ts < trade_start_ms:
+            armed = update_armed(armed, o, l, upper_0236)
             continue
 
         armed = update_armed(armed, o, l, upper_0236)
@@ -298,15 +349,15 @@ def run_backtest(
             continue
         cnt_armed_break += 1
 
-        closed_vols = [float(x[5]) for x in closed]
-        vol_pass, quote_vol, rel_vol = volume_ok(v, c, closed_vols)
+        if not closed:
+            skipped_vol += 1
+            cnt_fail_vol_abs += 1
+            continue
+        prev = closed[-1]
+        vol_pass, quote_vol = prev_candle_quote_ok(float(prev[5]), float(prev[4]))
         if not vol_pass:
-            if quote_vol < MIN_CANDLE_QUOTE_VOL:
-                skipped_vol += 1
-                cnt_fail_vol_abs += 1
-            else:
-                skipped_vol += 1
-                cnt_fail_vol_rel += 1
+            skipped_vol += 1
+            cnt_fail_vol_abs += 1
             continue
 
         candle_pct = candle_up_pct(o, h)
@@ -317,12 +368,16 @@ def run_backtest(
         cnt_pass += 1
         fill = entry_fill_price(o, h, l, upper_0786)
         qty = ORDER_USDT / fill
+        rem_qty = qty
         entry_price = fill
         entry_time = ts
         entry_candle_low = l
         high_water = fill
         trail_armed = False
-        entry_vol_ratio = quote_vol  # stored as USDT quote vol
+        partial_taken = False
+        realized_pnl = 0.0
+        realized_fees = 0.0
+        entry_vol_ratio = quote_vol
         entry_candle_pct = candle_pct
         in_pos = True
         armed = False
@@ -331,7 +386,7 @@ def run_backtest(
                 f"BUY  #{len(trades)+1:03d} | {ms_to_str(ts)} | "
                 f"price={fill:.8f} | grey={upper_0236:.8f} | "
                 f"entry0786={upper_0786:.8f} | red={upper_1000:.8f} | "
-                f"1m_vol={quote_vol/1e3:.0f}K | rel={rel_vol:.2f}x | "
+                f"prev_1m_vol={quote_vol/1e3:.0f}K | "
                 f"up={candle_pct:.2f}% | low={l:.8f} open={o:.8f}"
             )
 
@@ -345,12 +400,8 @@ def run_backtest(
         print("\nFilter funnel:")
         print(f"  FBB armed persist + 0.786 break : {cnt_armed_break}")
         print(
-            f"  fail 1m quote vol   : {cnt_fail_vol_abs}  "
+            f"  fail prev 1m quote vol: {cnt_fail_vol_abs}  "
             f"(need >= {MIN_CANDLE_QUOTE_VOL:.0f})"
-        )
-        print(
-            f"  fail rel volume     : {cnt_fail_vol_rel}  "
-            f"(need >= {VOL_MULT}x avg{VOL_LOOKBACK})"
         )
         print(f"  fail candle pct     : {cnt_fail_pct}  (need >= {MIN_CANDLE_PCT}%)")
         print(f"  passed all (entries): {cnt_pass}")
@@ -378,13 +429,14 @@ def print_symbol_summary(
     print(f"Candles    : {len(ohlcv)}")
     print(f"Trades     : {len(trades)}")
     print(f"Notional   : {ORDER_USDT} USDT / trade")
-    print(f"1m vol min : >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT")
-    print(f"Rel volume : >= {VOL_MULT}x avg({VOL_LOOKBACK})")
+    print(f"1m vol min : prev closed >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
     print("Armed       : grey dip persists until FBB 0.786 break")
     print(
-        f"Exit        : entry-candle-low | EMA{EMA_PERIOD} 5m until "
-        f"+{TRAIL_ACTIVATE_PCT:.0f}% tick | trail -{TRAIL_PCT:.0f}% (floor=entry)"
+        f"Exit        : entry-candle-low | "
+        f"{'partial '+str(int(PARTIAL_TP_FRAC*100))+'%@+'+str(int(PARTIAL_TP_PCT))+'% + ' if PARTIAL_TP_PCT>0 else ''}"
+        f"EMA{EMA_PERIOD} 5m"
+        f"{'' if not USE_TRAIL else f' / +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%'}"
     )
 
     if not trades:
@@ -609,13 +661,21 @@ async def main() -> None:
                 f"Universe: {len(symbols)} / {total_uni} spot USDT pairs "
                 f"(first {UNIVERSE_LIMIT or 'all'}, sorted A-Z, no 24h filter)"
             )
+        partial_bit = (
+            f"partial {PARTIAL_TP_FRAC*100:.0f}%@{PARTIAL_TP_PCT:.0f}% + "
+            if PARTIAL_TP_PCT > 0
+            else ""
+        )
+        trail_bit = (
+            f" / +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
+            if USE_TRAIL
+            else " / no trail"
+        )
         print(
             f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m FBB 0.786 break | "
-            f"quote vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
-            f"rel>={VOL_MULT}x avg{VOL_LOOKBACK} | "
+            f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
             f"candle>={MIN_CANDLE_PCT}% | "
-            f"exit entry-candle-low / EMA{EMA_PERIOD} 5m / +{TRAIL_ACTIVATE_PCT:.0f}% tick "
-            f"trail -{TRAIL_PCT:.0f}% | "
+            f"exit entry-candle-low / {partial_bit}EMA{EMA_PERIOD} 5m{trail_bit} | "
             f"notional {ORDER_USDT} USDT"
         )
         print("-" * 72)

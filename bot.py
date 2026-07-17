@@ -4,13 +4,13 @@ Fibonacci Bollinger Instant Breakout — Binance Spot
 Entry (1m, instant on FBB 0.786 break — one band below red):
   1) Grey dip arms (persists across candles until entry)
   2) Price breaks FBB upper 0.786
-  3) 1m quote vol >= MIN_CANDLE_QUOTE_VOL, rel >= VOL_MULT x avg
+  3) Previous closed 1m quote vol >= MIN_CANDLE_QUOTE_VOL (no rel filter)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
 Exit:
   - Stop: entry 1m candle low (structure)
-  - Before +TRAIL_ACTIVATE_PCT% (tick): 5m close below EMA9
-  - After +TRAIL_ACTIVATE_PCT% (intrabar OK): TRAIL_PCT% trail from high (floor=entry)
+  - Scale-out: PARTIAL_TP_FRAC at +PARTIAL_TP_PCT% (default 50% @ +5%)
+  - Runner: 5m close below EMA9 (trail only if USE_TRAIL=1)
 """
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ from markets import list_spot_usdt_symbols
 from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
     EMA_PERIOD,
-    ENTRY_VOL_LIMIT,
     EXIT_TF_MS,
     FBB_LENGTH,
     FBB_MULT,
@@ -41,23 +40,25 @@ from strategy import (
     MIN_CANDLE_QUOTE_VOL,
     OHLCV_LIMIT,
     ORDER_USDT,
+    PARTIAL_TP_FRAC,
+    PARTIAL_TP_PCT,
     TIMEFRAME,
     TIMEFRAME_MS,
-    VOL_LOOKBACK,
-    VOL_MULT,
-    candle_up_pct,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
+    USE_TRAIL,
+    candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_rules_met,
     five_m_just_closed,
     ohlcv_with_active,
+    partial_tp_hit,
     trail_should_arm,
     trail_stop_hit,
+    prev_candle_quote_ok,
     price_entry_ready,
     update_armed,
-    volume_ok,
 )
 
 # Always load .env next to this file (not depending on shell cwd)
@@ -108,6 +109,8 @@ class Position:
     trail_armed: bool = False
     entry_candle_ts: int = 0
     close_pending: bool = False
+    partial_taken: bool = False
+    initial_amount: float = 0.0
 
 
 class FBBInstantBreakoutBot:
@@ -166,14 +169,23 @@ class FBBInstantBreakoutBot:
         await self.exchange.load_markets()
         await self.refresh_symbols()
         await self.warmup_all()
+        trail_txt = (
+            f"then +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
+            if USE_TRAIL
+            else "no trail"
+        )
+        partial_txt = (
+            f"partial {PARTIAL_TP_FRAC*100:.0f}%@{PARTIAL_TP_PCT:.0f}% + "
+            if PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0
+            else ""
+        )
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
-            "exit entry-candle-low / EMA%d 5m then +%.0f%% tick trail -%.0f%% | "
-            "telegram=%s",
+            "exit entry-candle-low / %sEMA%d 5m (%s) | telegram=%s",
             ORDER_USDT,
+            partial_txt,
             EMA_PERIOD,
-            TRAIL_ACTIVATE_PCT,
-            TRAIL_PCT,
+            trail_txt,
             "ON" if telegram_enabled() else "OFF",
         )
 
@@ -186,7 +198,7 @@ class FBBInstantBreakoutBot:
         ]
         log.info(
             "Live scan ON | %d spot coins websocket | armed persist | FBB refresh %ds | "
-            "volume on-demand per signal",
+            "prev-candle vol (local, no REST on signal)",
             len(self.symbols),
             FBB_REFRESH_SEC,
         )
@@ -217,13 +229,11 @@ class FBBInstantBreakoutBot:
 
         log.info(
             "Universe: %d spot USDT pairs | +%d / -%d | "
-            "entry: 1m vol>=%.0f USDT & >=%.1fx avg%d & up>=%.1f%%",
+            "entry: prev 1m vol>=%.0f USDT & up>=%.1f%%",
             len(self.symbols),
             len(added),
             len(removed),
             MIN_CANDLE_QUOTE_VOL,
-            VOL_MULT,
-            VOL_LOOKBACK,
             MIN_CANDLE_PCT,
         )
 
@@ -335,54 +345,6 @@ class FBBInstantBreakoutBot:
         if reset_flags:
             state.broke_red = False
         self._update_entry_arm(state)
-
-    async def _fetch_volume_for_entry(
-        self, symbol: str
-    ) -> tuple[float, list[float], float] | None:
-        """
-        Light REST for one coin after price rules pass.
-        Returns (active_base_vol, closed_base_vols, active_close) — same as backtest v*c.
-        """
-        try:
-            candles = await self.exchange.fetch_ohlcv(
-                symbol, TIMEFRAME, limit=ENTRY_VOL_LIMIT
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.debug("volume fetch failed %s: %s", symbol, exc)
-            return None
-
-        if not candles or len(candles) < VOL_LOOKBACK + 1:
-            return None
-
-        now_ms = int(self.exchange.milliseconds())
-        last_ts = int(candles[-1][0])
-        if now_ms - last_ts < TIMEFRAME_MS:
-            active = candles[-1]
-            closed = candles[:-1]
-        else:
-            active = candles[-1]
-            closed = candles
-
-        if len(closed) < VOL_LOOKBACK:
-            return None
-
-        active_vol = float(active[5])
-        close_px = float(active[4])
-        closed_vols = [float(c[5]) for c in closed]
-
-        state = self.states.get(symbol)
-        if state is not None:
-            state.volume = active_vol
-
-        return active_vol, closed_vols, close_px
-
-    def _volume_ok_snapshot(
-        self,
-        active_vol: float,
-        close_price: float,
-        closed_base_volumes: list[float],
-    ) -> tuple[bool, float, float]:
-        return volume_ok(active_vol, close_price, closed_base_volumes)
 
     def _price_entry_ready(self, state: SymbolState) -> bool:
         return price_entry_ready(
@@ -545,22 +507,19 @@ class FBBInstantBreakoutBot:
 
         candle_pct = candle_up_pct(state.open, state.high)
 
-        # REST volume check — do NOT mark broke_red yet (volume builds mid-candle)
-        vol_snap = await self._fetch_volume_for_entry(state.symbol)
-        if vol_snap is None:
+        # Previous CLOSED 1m only (already in state.ohlcv) — no REST, no rel
+        if not state.ohlcv:
             return
-        active_vol, closed_vols, close_px = vol_snap
-        vol_ok, quote_vol, rel_vol = self._volume_ok_snapshot(
-            active_vol, close_px, closed_vols
-        )
+        prev = state.ohlcv[-1]
+        prev_base = float(prev[5])
+        prev_close = float(prev[4])
+        vol_ok, quote_vol = prev_candle_quote_ok(prev_base, prev_close)
         if not vol_ok:
             log.debug(
-                "WAIT VOL %s | 1m quote %.0f (min %.0f) | rel %.2fx (min %.1fx)",
+                "WAIT PREV VOL %s | prev 1m quote %.0f (min %.0f)",
                 state.symbol,
                 quote_vol,
                 MIN_CANDLE_QUOTE_VOL,
-                rel_vol,
-                VOL_MULT,
             )
             return
 
@@ -574,19 +533,16 @@ class FBBInstantBreakoutBot:
                 state.upper_0786,
             ):
                 return
-            # Commit this candle only once volume + price rules pass
             state.broke_red = True
             log.info(
                 "SIGNAL BUY %s | high=%.6f > entry0786=%.6f | red=%.6f | grey=%.6f | "
-                "1m_vol=%.0f USDT | rel=%.2fx | up=%.2f%% | "
-                "low=%.6f open=%.6f",
+                "prev_1m_vol=%.0f USDT | up=%.2f%% | low=%.6f open=%.6f",
                 state.symbol,
                 state.high,
                 state.upper_0786,
                 state.upper_1000,
                 state.upper_0236,
                 quote_vol,
-                rel_vol,
                 candle_pct,
                 state.low,
                 state.open,
@@ -598,7 +554,6 @@ class FBBInstantBreakoutBot:
             if ok:
                 state.entry_armed = False
             else:
-                # Allow retry this candle if order failed
                 state.broke_red = False
 
     async def _maybe_ema_exit(self, symbol: str) -> None:
@@ -639,6 +594,8 @@ class FBBInstantBreakoutBot:
             await self._market_close(symbol, reason=reason)
 
     def _maybe_arm_trail(self, symbol: str, high_water: float) -> None:
+        if not USE_TRAIL:
+            return
         pos = self.positions.get(symbol)
         if pos is None or pos.trail_armed:
             return
@@ -658,15 +615,51 @@ class FBBInstantBreakoutBot:
             return
 
         pos.high_since_entry = max(pos.high_since_entry, price)
+
+        # Scale-out first (50% @ +PARTIAL_TP_PCT)
+        hit_tp, tp_px = partial_tp_hit(
+            pos.entry_price, pos.high_since_entry, taken=pos.partial_taken
+        )
+        if hit_tp:
+            pos.close_pending = True
+            async with self._trade_lock:
+                if symbol not in self.positions:
+                    return
+                cur = self.positions[symbol]
+                if cur.partial_taken:
+                    cur.close_pending = False
+                    return
+                log.info(
+                    "PARTIAL TP %s | +%.0f%% touch | sell %.0f%% @~%.6f | entry=%.6f",
+                    symbol,
+                    PARTIAL_TP_PCT,
+                    PARTIAL_TP_FRAC * 100,
+                    tp_px,
+                    cur.entry_price,
+                )
+                ok = await self._market_sell_partial(
+                    symbol,
+                    PARTIAL_TP_FRAC,
+                    reason=f"partial +{PARTIAL_TP_PCT:.0f}%",
+                )
+                if not ok:
+                    cur = self.positions.get(symbol)
+                    if cur is not None:
+                        cur.close_pending = False
+                return
+
         self._maybe_arm_trail(symbol, pos.high_since_entry)
 
-        hit, stop_fill = trail_stop_hit(
-            pos.entry_price,
-            pos.high_since_entry,
-            price,
-            armed=pos.trail_armed,
-        )
-        reason = f"trail -{TRAIL_PCT}%"
+        hit, stop_fill = False, 0.0
+        reason = ""
+        if USE_TRAIL:
+            hit, stop_fill = trail_stop_hit(
+                pos.entry_price,
+                pos.high_since_entry,
+                price,
+                armed=pos.trail_armed,
+            )
+            reason = f"trail -{TRAIL_PCT}%"
         if not hit:
             hit, stop_fill = entry_candle_stop_hit(pos.entry_candle_low, price)
             reason = "entry candle low"
@@ -742,6 +735,8 @@ class FBBInstantBreakoutBot:
                 high_since_entry=fill,
                 trail_armed=False,
                 entry_candle_ts=entry_candle_ts,
+                partial_taken=False,
+                initial_amount=filled,
             )
             self.held_symbols.add(symbol)
             log.info(
@@ -782,6 +777,78 @@ class FBBInstantBreakoutBot:
             symbol,
             len(self.positions),
         )
+
+    async def _market_sell_partial(
+        self, symbol: str, frac: float, reason: str
+    ) -> bool:
+        """Sell a fraction of the open position; keep runner unlocked for EMA/stop."""
+        pos = self.positions.get(symbol)
+        if pos is None or frac <= 0 or frac >= 1:
+            if pos is not None:
+                pos.close_pending = False
+            return False
+        try:
+            base_amt = pos.initial_amount if pos.initial_amount > 0 else pos.amount
+            sell_amt = base_amt * frac
+            try:
+                market = self.exchange.market(pos.symbol)
+                base = market.get("base") or pos.symbol.split("/")[0]
+                await asyncio.sleep(0.2)
+                bal = await self.exchange.fetch_balance()
+                free = float(
+                    (bal.get(base) or {}).get("free")
+                    or (bal.get("free") or {}).get(base)
+                    or 0
+                )
+                if free > 0:
+                    sell_amt = min(sell_amt, free * 0.99, pos.amount)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("partial balance: %s", exc)
+
+            sell_amt = float(self.exchange.amount_to_precision(pos.symbol, sell_amt))
+            if sell_amt <= 0:
+                log.warning("Partial sell qty=0 on %s", symbol)
+                pos.close_pending = False
+                return False
+
+            entry = pos.entry_price
+            order = await self.exchange.create_order(
+                pos.symbol, "market", "sell", sell_amt
+            )
+            exit_px = float(order.get("average") or order.get("price") or entry)
+            pos.amount = max(0.0, pos.amount - sell_amt)
+            pos.partial_taken = True
+            pos.close_pending = False
+            log.info(
+                "ORDER PARTIAL SELL | %s | reason=%s | qty=%s | left=%s | avg=%.6f",
+                symbol,
+                reason,
+                sell_amt,
+                pos.amount,
+                exit_px,
+            )
+            await notify_sell(
+                symbol,
+                reason=reason,
+                entry=entry,
+                exit_price=exit_px,
+                qty=sell_amt,
+                order_id=str(order.get("id") or ""),
+            )
+            # If dust left, close fully
+            min_amt = (
+                (self.exchange.market(symbol).get("limits") or {})
+                .get("amount", {})
+                .get("min")
+            )
+            if min_amt and pos.amount < float(min_amt):
+                await self._market_close(symbol, reason="dust after partial")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.error("Partial sell failed %s: %s", symbol, exc)
+            if pos := self.positions.get(symbol):
+                pos.close_pending = False
+            return False
 
     async def _market_close(self, symbol: str, reason: str = "") -> None:
         pos = self.positions.get(symbol)

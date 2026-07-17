@@ -29,7 +29,6 @@ from strategy import (  # noqa: E402
     OHLCV_LIMIT,
     ORDER_USDT,
     TIMEFRAME,
-    VOL_MULT,
 )
 from bot import API_KEY, API_SECRET  # noqa: E402
 
@@ -267,7 +266,7 @@ async def main(
         print("=" * 60)
         print("FBB BOT - LIVE HEALTH CHECK (Binance SPOT DEMO)")
         print("=" * 60)
-        print(f"Filters: 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} | rel>={VOL_MULT}x")
+        print(f"Filters: prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
         print(f"         candle>={MIN_CANDLE_PCT}% | notional={ORDER_USDT} USDT")
         print("         exit: entry-candle-low / EMA9 5m / trail")
         print(f"Demo Spot API key: {_key_hint()}")
