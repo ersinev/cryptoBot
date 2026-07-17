@@ -28,7 +28,7 @@ MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "4.0"))
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "3.0"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
 

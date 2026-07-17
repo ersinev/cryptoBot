@@ -543,9 +543,9 @@ class FBBInstantBreakoutBot:
         if not self._price_entry_ready(state):
             return
 
-        state.broke_red = True
         candle_pct = candle_up_pct(state.open, state.high)
 
+        # REST volume check — do NOT mark broke_red yet (volume builds mid-candle)
         vol_snap = await self._fetch_volume_for_entry(state.symbol)
         if vol_snap is None:
             return
@@ -565,7 +565,7 @@ class FBBInstantBreakoutBot:
             return
 
         async with self._trade_lock:
-            if state.symbol in self.held_symbols:
+            if state.symbol in self.held_symbols or state.broke_red:
                 return
             if not entry_rules_met(
                 state.entry_armed,
@@ -574,6 +574,8 @@ class FBBInstantBreakoutBot:
                 state.upper_0786,
             ):
                 return
+            # Commit this candle only once volume + price rules pass
+            state.broke_red = True
             log.info(
                 "SIGNAL BUY %s | high=%.6f > entry0786=%.6f | red=%.6f | grey=%.6f | "
                 "1m_vol=%.0f USDT | rel=%.2fx | up=%.2f%% | "
@@ -595,6 +597,9 @@ class FBBInstantBreakoutBot:
             )
             if ok:
                 state.entry_armed = False
+            else:
+                # Allow retry this candle if order failed
+                state.broke_red = False
 
     async def _maybe_ema_exit(self, symbol: str) -> None:
         if symbol not in self.positions:
