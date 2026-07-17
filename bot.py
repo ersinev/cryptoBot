@@ -1,9 +1,9 @@
 """
 Fibonacci Bollinger Instant Breakout — Binance Spot
 
-Entry (1m, instant on red break):
+Entry (1m, instant on FBB 0.786 break — one band below red):
   1) Grey dip arms (persists across candles until entry)
-  2) Price breaks FBB upper 1.000
+  2) Price breaks FBB upper 0.786
   3) 1m quote vol >= MIN_CANDLE_QUOTE_VOL, rel >= VOL_MULT x avg
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
@@ -89,8 +89,9 @@ class SymbolState:
     low: float = float("inf")
     close: float = 0.0
     volume: float = 0.0  # active candle volume (from last OHLCV sync)
-    upper_0236: float = 0.0
-    upper_1000: float = 0.0
+    upper_0236: float = 0.0  # grey — arm
+    upper_0786: float = 0.0  # entry break (one below red)
+    upper_1000: float = 0.0  # red
     ready: bool = False
     entry_armed: bool = False  # grey dip — persists until entry
     broke_red: bool = False  # one entry attempt per 1m candle (backtest parity)
@@ -166,7 +167,7 @@ class FBBInstantBreakoutBot:
         await self.refresh_symbols()
         await self.warmup_all()
         log.info(
-            "Config: %s USDT/trade | spot DEMO | 1m instant red break | "
+            "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
             "exit entry-candle-low / EMA%d 5m then 1m-close +%.0f%% trail -%.0f%% | "
             "telegram=%s",
             ORDER_USDT,
@@ -302,14 +303,14 @@ class FBBInstantBreakoutBot:
                 state, ts=border, o=px, h=px, l=px, c=px, v=0.0, reset_flags=True
             )
 
-        state.ready = state.upper_1000 > 0
+        state.ready = state.upper_0786 > 0
 
     def _recompute_indicators(self, state: SymbolState) -> None:
         fbb = fibonacci_bollinger(state.ohlcv, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:
             state.ready = False
             return
-        state.upper_0236, state.upper_1000, _ = fbb
+        state.upper_0236, state.upper_0786, state.upper_1000, _ = fbb
 
     def _apply_active(
         self,
@@ -389,7 +390,7 @@ class FBBInstantBreakoutBot:
             state.broke_red,
             state.high,
             state.open,
-            state.upper_1000,
+            state.upper_0786,
         )
 
     def _update_entry_arm(self, state: SymbolState) -> None:
@@ -576,15 +577,16 @@ class FBBInstantBreakoutBot:
                 state.entry_armed,
                 state.high,
                 state.open,
-                state.upper_1000,
+                state.upper_0786,
             ):
                 return
             log.info(
-                "SIGNAL BUY %s | high=%.6f > red=%.6f | grey=%.6f | "
+                "SIGNAL BUY %s | high=%.6f > entry0786=%.6f | red=%.6f | grey=%.6f | "
                 "1m_vol=%.0f USDT | rel=%.2fx | up=%.2f%% | "
                 "low=%.6f open=%.6f",
                 state.symbol,
                 state.high,
+                state.upper_0786,
                 state.upper_1000,
                 state.upper_0236,
                 quote_vol,

@@ -30,7 +30,7 @@ ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "4.0"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "5.0"))
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
 
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
@@ -80,8 +80,14 @@ def update_armed(armed: bool, o: float, l: float, grey: float) -> bool:
     return armed
 
 
+def broke_entry_line(h: float, entry_line: float) -> bool:
+    """Break of FBB upper 0.786 (one band below red 1.000)."""
+    return h > entry_line
+
+
 def broke_red_line(h: float, red: float) -> bool:
-    return h > red
+    """Deprecated alias — prefer broke_entry_line (0.786)."""
+    return broke_entry_line(h, red)
 
 
 def candle_up_pct(o: float, h: float) -> float:
@@ -90,8 +96,8 @@ def candle_up_pct(o: float, h: float) -> float:
     return (h - o) / o * 100.0
 
 
-def entry_fill_price(o: float, h: float, l: float, red: float) -> float:
-    fill = o if o > red else red
+def entry_fill_price(o: float, h: float, l: float, entry_line: float) -> float:
+    fill = o if o > entry_line else entry_line
     return min(max(fill, l), h)
 
 
@@ -113,10 +119,10 @@ def volume_ok(
     return rel >= VOL_MULT, quote_vol, rel
 
 
-def entry_rules_met(armed: bool, high: float, open_: float, red: float) -> bool:
+def entry_rules_met(armed: bool, high: float, open_: float, entry_line: float) -> bool:
     if not armed:
         return False
-    if high <= red:
+    if high <= entry_line:
         return False
     if open_ <= 0:
         return False
@@ -128,12 +134,12 @@ def price_entry_ready(
     tried_this_candle: bool,
     high: float,
     open_: float,
-    red: float,
+    entry_line: float,
 ) -> bool:
     """Price rules only — one evaluation per 1m candle (like backtest bar)."""
     if not armed or tried_this_candle:
         return False
-    if high <= red:
+    if high <= entry_line:
         return False
     if open_ <= 0:
         return False

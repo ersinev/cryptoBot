@@ -48,16 +48,17 @@ def fibonacci_bollinger(
     ohlcv: list[list[float]],
     length: int = 200,
     mult: float = 3.0,
-) -> tuple[float, float, float] | None:
+) -> tuple[float, float, float, float] | None:
     """
     Fibonacci Bollinger Bands (TradingView / Rashad style).
 
     basis = VWMA(hlc3, length)           # purple middle line
     dev   = mult * stdev(hlc3, length)
-    upper_0.236 = basis + 0.236 * dev    # first grey above purple
+    upper_0.236 = basis + 0.236 * dev    # grey — arm on dip
+    upper_0.786 = basis + 0.786 * dev    # entry break (one below red)
     upper_1.000 = basis + 1.000 * dev    # top red line
 
-    Returns (upper_0236, upper_1000, basis) or None if not enough data.
+    Returns (upper_0236, upper_0786, upper_1000, basis) or None if not enough data.
     """
     if len(ohlcv) < length:
         return None
@@ -72,5 +73,6 @@ def fibonacci_bollinger(
     basis = vwma(src, volume, length)
     dev = mult * stdev(src, length)
     upper_0236 = basis + 0.236 * dev
+    upper_0786 = basis + 0.786 * dev
     upper_1000 = basis + 1.0 * dev
-    return upper_0236, upper_1000, basis
+    return upper_0236, upper_0786, upper_1000, basis

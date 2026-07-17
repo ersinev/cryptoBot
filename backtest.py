@@ -34,7 +34,7 @@ from strategy import (
     aggregate_ohlcv,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
-    broke_red_line,
+    broke_entry_line,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
@@ -237,7 +237,7 @@ def run_backtest(
     if verbose:
         print(f"\nRunning backtest on {n} closed 1m candles...\n")
         print(
-            f"Entry: armed persist + red break | vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | "
+            f"Entry: armed persist + FBB 0.786 break | vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | "
             f"rel >= {VOL_MULT}x | candle >= {MIN_CANDLE_PCT}%\n"
         )
         print(
@@ -284,7 +284,7 @@ def run_backtest(
         fbb = fibonacci_bollinger(closed, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:
             continue
-        upper_0236, upper_1000, _ = fbb
+        upper_0236, upper_0786, upper_1000, _ = fbb
 
         if in_pos:
             continue
@@ -294,7 +294,7 @@ def run_backtest(
 
         armed = update_armed(armed, o, l, upper_0236)
 
-        if not (armed and broke_red_line(h, upper_1000)):
+        if not (armed and broke_entry_line(h, upper_0786)):
             continue
         cnt_armed_break += 1
 
@@ -315,7 +315,7 @@ def run_backtest(
             continue
 
         cnt_pass += 1
-        fill = entry_fill_price(o, h, l, upper_1000)
+        fill = entry_fill_price(o, h, l, upper_0786)
         qty = ORDER_USDT / fill
         entry_price = fill
         entry_time = ts
@@ -329,7 +329,8 @@ def run_backtest(
         if verbose:
             print(
                 f"BUY  #{len(trades)+1:03d} | {ms_to_str(ts)} | "
-                f"price={fill:.8f} | grey={upper_0236:.8f} | red={upper_1000:.8f} | "
+                f"price={fill:.8f} | grey={upper_0236:.8f} | "
+                f"entry0786={upper_0786:.8f} | red={upper_1000:.8f} | "
                 f"1m_vol={quote_vol/1e3:.0f}K | rel={rel_vol:.2f}x | "
                 f"up={candle_pct:.2f}% | low={l:.8f} open={o:.8f}"
             )
@@ -342,7 +343,7 @@ def run_backtest(
         )
     if verbose:
         print("\nFilter funnel:")
-        print(f"  FBB armed persist + red break : {cnt_armed_break}")
+        print(f"  FBB armed persist + 0.786 break : {cnt_armed_break}")
         print(
             f"  fail 1m quote vol   : {cnt_fail_vol_abs}  "
             f"(need >= {MIN_CANDLE_QUOTE_VOL:.0f})"
@@ -365,7 +366,7 @@ def print_symbol_summary(
 ) -> float:
     """AKE-style summary: dates first, then numbered BUY/SELL list."""
     print("\n" + "=" * 72)
-    print(f"RESULT - {symbol} | {window_label} | 1m red break + EMA9/trail")
+    print(f"RESULT - {symbol} | {window_label} | 1m FBB 0.786 break + EMA9/trail")
     print("=" * 72)
     if not ohlcv:
         print("No data.")
@@ -380,7 +381,7 @@ def print_symbol_summary(
     print(f"1m vol min : >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT")
     print(f"Rel volume : >= {VOL_MULT}x avg({VOL_LOOKBACK})")
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
-    print("Armed       : grey dip persists until red break (any 1m candle)")
+    print("Armed       : grey dip persists until FBB 0.786 break")
     print(
         f"Exit        : entry-candle-low | EMA{EMA_PERIOD} 5m until 1m CLOSE "
         f"+{TRAIL_ACTIVATE_PCT:.0f}% | trail -{TRAIL_PCT:.0f}% (floor=entry)"
@@ -609,7 +610,7 @@ async def main() -> None:
                 f"(first {UNIVERSE_LIMIT or 'all'}, sorted A-Z, no 24h filter)"
             )
         print(
-            f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m red break | "
+            f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m FBB 0.786 break | "
             f"quote vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
             f"rel>={VOL_MULT}x avg{VOL_LOOKBACK} | "
             f"candle>={MIN_CANDLE_PCT}% | "
