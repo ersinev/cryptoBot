@@ -9,8 +9,8 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
 
 Exit:
   - Stop: entry 1m candle low (structure)
-  - Before 1m CLOSE +TRAIL_ACTIVATE_PCT%: 5m close below EMA9
-  - After 1m CLOSE +TRAIL_ACTIVATE_PCT%: TRAIL_PCT% trail from high (floor=entry)
+  - Before +TRAIL_ACTIVATE_PCT% (tick): 5m close below EMA9
+  - After +TRAIL_ACTIVATE_PCT% (intrabar OK): TRAIL_PCT% trail from high (floor=entry)
 """
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ class FBBInstantBreakoutBot:
         await self.warmup_all()
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
-            "exit entry-candle-low / EMA%d 5m then 1m-close +%.0f%% trail -%.0f%% | "
+            "exit entry-candle-low / EMA%d 5m then +%.0f%% tick trail -%.0f%% | "
             "telegram=%s",
             ORDER_USDT,
             EMA_PERIOD,
@@ -457,10 +457,6 @@ class FBBInstantBreakoutBot:
 
             for sym in list(self.positions.keys()):
                 await self._fetch_and_apply_ohlcv(sym)
-                state = self.states.get(sym)
-                if state is not None and state.ohlcv:
-                    # Arm trail on last CLOSED 1m close (not wick tip)
-                    self._maybe_arm_trail(sym, float(state.ohlcv[-1][4]))
 
             if five_m_closed and self.positions:
                 for sym in list(self.positions.keys()):
@@ -472,8 +468,6 @@ class FBBInstantBreakoutBot:
                     continue
                 if state.candle_ts < border_ts:
                     closed_close = state.close or state.open
-                    if sym in self.positions:
-                        self._maybe_arm_trail(sym, closed_close)
                     self._roll_local_candle(state, border_ts, closed_close)
 
     # ------------------------------------------------------------------
@@ -639,16 +633,16 @@ class FBBInstantBreakoutBot:
             )
             await self._market_close(symbol, reason=reason)
 
-    def _maybe_arm_trail(self, symbol: str, close: float) -> None:
+    def _maybe_arm_trail(self, symbol: str, high_water: float) -> None:
         pos = self.positions.get(symbol)
         if pos is None or pos.trail_armed:
             return
-        if trail_should_arm(pos.entry_price, close):
+        if trail_should_arm(pos.entry_price, high_water):
             pos.trail_armed = True
             log.info(
-                "TRAIL ARMED %s | 1m close=%.6f >= +%.0f%% of entry=%.6f",
+                "TRAIL ARMED %s | high=%.6f >= +%.0f%% of entry=%.6f (intrabar)",
                 symbol,
-                close,
+                high_water,
                 TRAIL_ACTIVATE_PCT,
                 pos.entry_price,
             )
@@ -659,6 +653,7 @@ class FBBInstantBreakoutBot:
             return
 
         pos.high_since_entry = max(pos.high_since_entry, price)
+        self._maybe_arm_trail(symbol, pos.high_since_entry)
 
         hit, stop_fill = trail_stop_hit(
             pos.entry_price,

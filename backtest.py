@@ -241,8 +241,8 @@ def run_backtest(
             f"rel >= {VOL_MULT}x | candle >= {MIN_CANDLE_PCT}%\n"
         )
         print(
-            f"Exit: entry-candle-low | EMA{EMA_PERIOD} 5m until 1m CLOSE "
-            f"+{TRAIL_ACTIVATE_PCT:.0f}% | then trail -{TRAIL_PCT:.0f}% (floor=entry)\n"
+            f"Exit: entry-candle-low | EMA{EMA_PERIOD} 5m until +{TRAIL_ACTIVATE_PCT:.0f}% "
+            f"(intrabar) | then trail -{TRAIL_PCT:.0f}% (floor=entry)\n"
         )
         print("-" * 72)
 
@@ -258,6 +258,10 @@ def run_backtest(
 
         if in_pos:
             high_water = max(high_water, h)
+            # Arm on intrabar high (+activate%), then trail can fire on same bar low
+            if trail_should_arm(entry_price, high_water):
+                trail_armed = True
+
             hit, fill = trail_stop_hit(
                 entry_price, high_water, l, armed=trail_armed
             )
@@ -276,10 +280,6 @@ def run_backtest(
                 if should_exit:
                     _close_pos(ts, bar_close, reason)
                     continue
-
-            # Arm only after this 1m candle CLOSES above +activate% (ignore wick)
-            if trail_should_arm(entry_price, c):
-                trail_armed = True
 
         fbb = fibonacci_bollinger(closed, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:
@@ -383,8 +383,8 @@ def print_symbol_summary(
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
     print("Armed       : grey dip persists until FBB 0.786 break")
     print(
-        f"Exit        : entry-candle-low | EMA{EMA_PERIOD} 5m until 1m CLOSE "
-        f"+{TRAIL_ACTIVATE_PCT:.0f}% | trail -{TRAIL_PCT:.0f}% (floor=entry)"
+        f"Exit        : entry-candle-low | EMA{EMA_PERIOD} 5m until "
+        f"+{TRAIL_ACTIVATE_PCT:.0f}% tick | trail -{TRAIL_PCT:.0f}% (floor=entry)"
     )
 
     if not trades:
@@ -614,8 +614,8 @@ async def main() -> None:
             f"quote vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
             f"rel>={VOL_MULT}x avg{VOL_LOOKBACK} | "
             f"candle>={MIN_CANDLE_PCT}% | "
-            f"exit entry-candle-low / EMA{EMA_PERIOD} 5m / 1m-close "
-            f"+{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}% | "
+            f"exit entry-candle-low / EMA{EMA_PERIOD} 5m / +{TRAIL_ACTIVATE_PCT:.0f}% tick "
+            f"trail -{TRAIL_PCT:.0f}% | "
             f"notional {ORDER_USDT} USDT"
         )
         print("-" * 72)

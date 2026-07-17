@@ -155,17 +155,17 @@ def entry_candle_stop_hit(entry_candle_low: float, price: float) -> tuple[bool, 
     return True, max(entry_candle_low, price)
 
 
-def trail_should_arm(entry: float, close: float) -> bool:
-    """Arm trail only on a 1m CLOSE >= +TRAIL_ACTIVATE_PCT% (ignore wick ticks)."""
-    if entry <= 0 or close <= 0:
+def trail_should_arm(entry: float, high_water: float) -> bool:
+    """Arm trail when price has traded +TRAIL_ACTIVATE_PCT% above entry (intrabar OK)."""
+    if entry <= 0 or high_water <= 0:
         return False
-    return close >= entry * (1.0 + TRAIL_ACTIVATE_PCT / 100.0)
+    return high_water >= entry * (1.0 + TRAIL_ACTIVATE_PCT / 100.0)
 
 
 def trail_stop_hit(
     entry: float, high_water: float, price: float, *, armed: bool
 ) -> tuple[bool, float]:
-    """Trailing stop — only after close-armed; floor at entry (no trail loss)."""
+    """Trailing stop — after arm; floor at entry (no trail loss)."""
     if not armed or entry <= 0 or high_water <= 0:
         return False, 0.0
     stop_px = max(entry, high_water * (1.0 - TRAIL_PCT / 100.0))
