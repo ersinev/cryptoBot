@@ -1,8 +1,8 @@
 """
-FBB Instant Breakout backtest (1m) — Binance USDT-M Futures Demo API.
+FBB Instant Breakout backtest (1m) — Binance Spot.
 
 Entry: armed persist (grey dip sticks) + red break + 10K vol + 3x + 4% candle
-Exit: hard -3% disaster stop | 5m candle close below EMA9
+Exit: entry-candle-low | EMA9 5m until 1m CLOSE +trail activate | then trail
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import ccxt.async_support as ccxt
 from dotenv import load_dotenv
 
 from indicators import fibonacci_bollinger
+from markets import list_spot_usdt_symbols
 from strategy import (
     EMA_PERIOD,
     EXIT_TF_MS,
@@ -54,13 +55,13 @@ LOOKBACK_DAYS = 7
 
 # Manual test symbols (empty → gainer list or full universe)
 SYMBOLS: list[str] = [
-    "STG/USDT:USDT",
-    "H/USDT:USDT",       # Humanity Protocol
-    "BEAT/USDT:USDT",    # Audiera
-    "GRASS/USDT:USDT",
-    "M/USDT:USDT",       # MemeCore
-    "OBOL/USDT:USDT",
-    "AKE/USDT:USDT",
+    "STG/USDT",
+    "H/USDT",
+    "BEAT/USDT",
+    "GRASS/USDT",
+    "M/USDT",
+    "OBOL/USDT",
+    "AKE/USDT",
 ]
 GAINER_TICKERS: list[str] = []
 UNIVERSE_LIMIT = 100
@@ -102,40 +103,32 @@ def ms_to_str(ms: int) -> str:
     )
 
 
-def make_exchange() -> ccxt.binanceusdm:
-    """Binance Futures Demo — same OHLCV feed as bot.py / Demo Trading."""
-    cfg: dict = {"enableRateLimit": True}
+def make_exchange() -> ccxt.binance:
+    """Binance Spot Demo — same feed style as bot.py."""
+    cfg: dict = {
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    }
     if API_KEY and API_SECRET:
         cfg["apiKey"] = API_KEY
         cfg["secret"] = API_SECRET
-    exchange = ccxt.binanceusdm(cfg)
-    exchange.enable_demo_trading(True)
+    exchange = ccxt.binance(cfg)
+    if API_KEY and API_SECRET:
+        exchange.enable_demo_trading(True)
     return exchange
 
 
 async def load_universe(exchange: ccxt.Exchange) -> list[str]:
-    """All active USDT-M swaps — same as bot.py (no 24h volume filter)."""
-    selected: list[str] = []
-    for symbol, market in exchange.markets.items():
-        if not market.get("active", True):
-            continue
-        if market.get("quote") != "USDT":
-            continue
-        if not market.get("swap", False) and not market.get("linear", False):
-            continue
-        if market.get("settle") not in (None, "USDT"):
-            continue
-        selected.append(symbol)
-    selected.sort()
-    return selected
+    """All active spot USDT pairs — same as bot.py."""
+    return list_spot_usdt_symbols(exchange.markets)
 
 
 def resolve_gainer_symbols(exchange: ccxt.Exchange) -> tuple[list[str], list[str]]:
-    """Map CMC gainer tickers to exact Binance USDM symbols (no fuzzy match)."""
+    """Map CMC gainer tickers to exact Binance spot symbols."""
     found: list[str] = []
     missing: list[str] = []
     for t in GAINER_TICKERS:
-        sym = f"{t}/USDT:USDT"
+        sym = f"{t}/USDT"
         if sym in exchange.markets:
             found.append(sym)
         else:
@@ -589,7 +582,7 @@ async def main() -> None:
     exchange = make_exchange()
     try:
         await exchange.load_markets()
-        print("Data source: Binance Futures Demo (demo-fapi.binance.com)")
+        print("Data source: Binance Spot Demo (enable_demo_trading)")
         if SYMBOLS:
             symbols = [s for s in SYMBOLS if s in exchange.markets]
             missing = [s for s in SYMBOLS if s not in exchange.markets]
@@ -600,11 +593,11 @@ async def main() -> None:
             symbols, missing_tickers = resolve_gainer_symbols(exchange)
             print(
                 f"Gainer list: {len(GAINER_TICKERS)} tickers | "
-                f"{len(symbols)} on Binance Futures | "
+                f"{len(symbols)} on Binance Spot | "
                 f"{len(missing_tickers)} not listed"
             )
             if missing_tickers:
-                print("Not on Binance USDM:", ", ".join(missing_tickers))
+                print("Not on Binance Spot:", ", ".join(missing_tickers))
             print(f"Universe: {symbols}")
         else:
             symbols = await load_universe(exchange)
@@ -612,11 +605,11 @@ async def main() -> None:
             if UNIVERSE_LIMIT and UNIVERSE_LIMIT > 0:
                 symbols = symbols[:UNIVERSE_LIMIT]
             print(
-                f"Universe: {len(symbols)} / {total_uni} USDT pairs "
+                f"Universe: {len(symbols)} / {total_uni} spot USDT pairs "
                 f"(first {UNIVERSE_LIMIT or 'all'}, sorted A-Z, no 24h filter)"
             )
         print(
-            f"BACKTEST | demo API | last {LOOKBACK_DAYS}d | 1m red break | "
+            f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m red break | "
             f"quote vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
             f"rel>={VOL_MULT}x avg{VOL_LOOKBACK} | "
             f"candle>={MIN_CANDLE_PCT}% | "

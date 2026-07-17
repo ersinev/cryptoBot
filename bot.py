@@ -1,11 +1,11 @@
 """
-Fibonacci Bollinger Instant Breakout — Binance USDT-M Futures (Demo)
+Fibonacci Bollinger Instant Breakout — Binance Spot
 
 Entry (1m, instant on red break):
   1) Grey dip arms (persists across candles until entry)
   2) Price breaks FBB upper 1.000
   3) 1m quote vol >= MIN_CANDLE_QUOTE_VOL, rel >= VOL_MULT x avg
-  4) Candle upside >= MIN_CANDLE_PCT → market buy
+  4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
 Exit:
   - Stop: entry 1m candle low (structure)
@@ -29,6 +29,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from indicators import fibonacci_bollinger
+from markets import list_spot_usdt_symbols
 from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
     EMA_PERIOD,
@@ -113,21 +114,21 @@ class FBBInstantBreakoutBot:
         if not API_KEY or not API_SECRET:
             raise SystemExit(
                 "BINANCE_API_KEY and BINANCE_SECRET must be set in .env "
-                "(see .env.example)."
+                "(see .env.example). Use Binance Demo Trading API keys."
             )
 
-        self.exchange = ccxtpro.binanceusdm(
+        self.exchange = ccxtpro.binance(
             {
                 "apiKey": API_KEY,
                 "secret": API_SECRET,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "future",
+                    "defaultType": "spot",
                     "adjustForTimeDifference": True,
+                    "createMarketBuyOrderRequiresPrice": False,
                 },
             }
         )
-        # enable_demo_trading() called in run() — must be awaited
 
         self.symbols: list[str] = []
         self.states: dict[str, SymbolState] = {}
@@ -159,13 +160,13 @@ class FBBInstantBreakoutBot:
             log.warning("Exchange close error: %s", exc)
 
     async def run(self) -> None:
-        log.info("Starting FBB Instant Breakout bot (Binance DEMO)")
+        log.info("Starting FBB Instant Breakout bot (Binance SPOT DEMO)")
         self.exchange.enable_demo_trading(True)
         await self.exchange.load_markets()
         await self.refresh_symbols()
         await self.warmup_all()
         log.info(
-            "Config: %s USDT/trade | 1m instant red break | "
+            "Config: %s USDT/trade | spot DEMO | 1m instant red break | "
             "exit entry-candle-low / EMA%d 5m then 1m-close +%.0f%% trail -%.0f%% | "
             "telegram=%s",
             ORDER_USDT,
@@ -183,7 +184,7 @@ class FBBInstantBreakoutBot:
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
         ]
         log.info(
-            "Live scan ON | %d coins websocket | armed persist | FBB refresh %ds | "
+            "Live scan ON | %d spot coins websocket | armed persist | FBB refresh %ds | "
             "volume on-demand per signal",
             len(self.symbols),
             FBB_REFRESH_SEC,
@@ -202,20 +203,8 @@ class FBBInstantBreakoutBot:
     # Universe
     # ------------------------------------------------------------------
     async def refresh_symbols(self) -> None:
-        """All active USDT-M swaps — no 24h volume filter."""
-        selected: list[str] = []
-        for symbol, market in self.exchange.markets.items():
-            if not market.get("active", True):
-                continue
-            if market.get("quote") != "USDT":
-                continue
-            if not market.get("swap", False) and not market.get("linear", False):
-                continue
-            if market.get("settle") not in (None, "USDT"):
-                continue
-            selected.append(symbol)
-
-        selected.sort()
+        """All active spot USDT pairs (no leveraged tokens)."""
+        selected = list_spot_usdt_symbols(self.exchange.markets)
         added = sorted(set(selected) - set(self.symbols))
         removed = sorted(set(self.symbols) - set(selected))
         self.symbols = selected
@@ -226,7 +215,7 @@ class FBBInstantBreakoutBot:
             self.states.setdefault(s, SymbolState(symbol=s))
 
         log.info(
-            "Universe: %d USDT pairs (all active) | +%d / -%d | "
+            "Universe: %d spot USDT pairs | +%d / -%d | "
             "entry: 1m vol>=%.0f USDT & >=%.1fx avg%d & up>=%.1f%%",
             len(self.symbols),
             len(added),
@@ -714,27 +703,34 @@ class FBBInstantBreakoutBot:
     ) -> bool:
         try:
             market = self.exchange.market(symbol)
-            amount = ORDER_USDT / max(ref_price, 1e-12)
-            amount = float(self.exchange.amount_to_precision(symbol, amount))
+            # Spot: spend ORDER_USDT quote
+            if hasattr(self.exchange, "create_market_buy_order_with_cost"):
+                order = await self.exchange.create_market_buy_order_with_cost(
+                    symbol, ORDER_USDT
+                )
+            else:
+                order = await self.exchange.create_order(
+                    symbol,
+                    "market",
+                    "buy",
+                    ORDER_USDT,
+                    params={"quoteOrderQty": ORDER_USDT},
+                )
+            fill = float(order.get("average") or order.get("price") or ref_price)
+            filled = float(order.get("filled") or 0.0)
+            if filled <= 0 and fill > 0:
+                filled = ORDER_USDT / fill
+            filled = float(self.exchange.amount_to_precision(symbol, filled))
             min_amt = (market.get("limits") or {}).get("amount", {}).get("min")
-            if min_amt and amount < float(min_amt):
+            if min_amt and filled < float(min_amt):
                 log.error(
-                    "Amount %.8f below min %s for %s — increase ORDER_USDT",
-                    amount,
+                    "Filled %.8f below min %s for %s — increase ORDER_USDT",
+                    filled,
                     min_amt,
                     symbol,
                 )
                 return False
-
-            order = await self.exchange.create_order(
-                symbol,
-                "market",
-                "buy",
-                amount,
-            )
-            fill = float(order.get("average") or order.get("price") or ref_price)
-            filled = float(order.get("filled") or amount)
-            notional = filled * fill
+            notional = filled * fill if fill > 0 else ORDER_USDT
             self.positions[symbol] = Position(
                 symbol=symbol,
                 amount=filled,
@@ -799,15 +795,20 @@ class FBBInstantBreakoutBot:
         try:
             amount = pos.amount
             try:
-                positions = await self.exchange.fetch_positions([pos.symbol])
-                for p in positions:
-                    contracts = abs(float(p.get("contracts") or 0))
-                    side = (p.get("side") or "").lower()
-                    if contracts > 0 and side in ("long", "both", ""):
-                        amount = contracts
-                        break
+                market = self.exchange.market(pos.symbol)
+                base = market.get("base") or pos.symbol.split("/")[0]
+                await asyncio.sleep(0.3)
+                bal = await self.exchange.fetch_balance()
+                free = float(
+                    (bal.get(base) or {}).get("free")
+                    or (bal.get("free") or {}).get(base)
+                    or 0
+                )
+                if free > 0:
+                    # Spot fee may leave slightly less than filled qty
+                    amount = min(amount, free)
             except Exception as exc:  # noqa: BLE001
-                log.debug("fetch_positions fallback: %s", exc)
+                log.debug("fetch_balance fallback: %s", exc)
 
             amount = float(self.exchange.amount_to_precision(pos.symbol, amount))
             if amount <= 0:
@@ -821,13 +822,12 @@ class FBBInstantBreakoutBot:
                 "market",
                 "sell",
                 amount,
-                params={"reduceOnly": True},
             )
             exit_px = float(
                 order.get("average") or order.get("price") or entry
             )
             log.info(
-                "ORDER SELL | %s | reason=%s | orderId=%s | qty=%s | reduceOnly | "
+                "ORDER SELL | %s | reason=%s | orderId=%s | qty=%s | "
                 "open_positions=%d",
                 pos.symbol,
                 reason or "close",

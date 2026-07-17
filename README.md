@@ -1,58 +1,60 @@
-# Fibonacci Bollinger Instant Breakout Bot
+# Fibonacci Bollinger Instant Breakout Bot (Binance Spot Demo)
 
-Async Binance USDT-M Futures scanner using `ccxt.pro` + `asyncio`.
+Async Binance **Spot Demo** scanner using `ccxt.pro` + `asyncio`.
 
 ## Strategy
 
-**Timeframe:** 5m  
-**Indicator:** Fibonacci Bollinger Bands (VWMA basis, length 200, mult 3.0)
+**Timeframe:** 1m entry / 5m EMA exit  
+**Indicator:** Fibonacci Bollinger Bands (length 200, mult 3.0)
 
 | Level | Role |
 |-------|------|
-| Upper 0.236 | Grey line just above purple basis — Open or Low must be below this |
-| Upper 1.000 | Red line — instant market buy when last price breaks above |
-| 9 EMA | Exit when a new 5m candle **closes** below it |
+| Upper 0.236 | Grey — Open or Low arms the setup |
+| Upper 1.000 | Red — instant market buy when high breaks |
+| Entry candle low | Structure stop |
+| 9 EMA (5m) | Exit until trail arms |
+| Trail | After 1m close +TRAIL_ACTIVATE_PCT%, trail TRAIL_PCT% from high (floor=entry) |
 
-Universe: all active USDT-M swaps. Entry also needs breakout 5m quote volume ≥ 5,000,000 USDT and candle upside ≥ 5%.
+Universe: all active spot USDT pairs (leveraged tokens excluded).
 
 ## Setup
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with **Demo Trading** API keys:
+
+1. binance.com → **Demo Trading** mode  
+2. API Management → create key (Spot)  
+3. Paste into `.env`
 
 ```env
 BINANCE_API_KEY=...
 BINANCE_SECRET=...
 ORDER_USDT=50
-MIN_CANDLE_QUOTE_VOL=5000000
-MIN_CANDLE_PCT=5.0
-MAX_ENTRIES_PER_DAY=2
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 ```
 
-## Run (Futures Testnet)
+## Run
 
 ```bash
 python bot.py
+python test_bot.py
+python backtest.py
 ```
 
-`bot.py` enables `set_sandbox_mode(True)` for [Binance Futures Testnet](https://testnet.binancefuture.com/).
+`bot.py` calls `enable_demo_trading(True)` — fake USDT, no real money.
 
-If you use **Binance Demo Trading** (main site demo), in `bot.py` replace sandbox mode with:
+## Live Spot later
 
-```python
-await self.exchange.enable_demo_trading(True)
-```
-
-and remove `self.exchange.set_sandbox_mode(True)`.
+Remove / disable `enable_demo_trading(True)` and use a live Spot API key.
 
 ## Notes
 
-- Only one long position at a time.
-- Entry does **not** wait for candle close; exit does.
-- Never commit real API secrets to git (`.env` is gitignored).
+- Long-only spot: buys spend USDT, sells the base coin.
+- Never commit `.env` (gitignored).

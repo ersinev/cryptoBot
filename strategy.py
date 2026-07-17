@@ -21,7 +21,7 @@ FBB_MULT = 3.0
 EXIT_TIMEFRAME = "5m"
 EXIT_TF_MS = 5 * 60 * 1000
 EMA_PERIOD = 9
-FEE_RATE = 0.0004
+FEE_RATE = 0.001  # spot taker ~0.1%
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
 MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))

@@ -1,10 +1,11 @@
 """
-Quick live health check for FBB bot.
+Quick live health check for FBB spot bot.
 
 Order test modes:
-  --order-test     100 USDT BTC buy + sell (round-trip)
-  --buy-only       100 USDT BTC buy only (open position stays — easiest to see in UI)
+  --order-test     ~100 USDT BTC buy + sell (round-trip)
+  --buy-only       ~100 USDT BTC buy only
   --order-only     Skip health checks, run --order-test
+  --sell-only      Sell free BTC balance
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+from markets import list_spot_usdt_symbols  # noqa: E402
 from strategy import (  # noqa: E402
     FBB_LENGTH,
     MIN_CANDLE_PCT,
@@ -27,22 +29,25 @@ from strategy import (  # noqa: E402
     OHLCV_LIMIT,
     ORDER_USDT,
     TIMEFRAME,
-    VOL_LOOKBACK,
     VOL_MULT,
 )
 from bot import API_KEY, API_SECRET  # noqa: E402
 
 TEST_USDT = 100.0
-TEST_SYMBOL = "BTC/USDT:USDT"
+TEST_SYMBOL = "BTC/USDT"
 
 
 async def make_exchange():
-    exchange = ccxtpro.binanceusdm(
+    exchange = ccxtpro.binance(
         {
             "apiKey": API_KEY,
             "secret": API_SECRET,
             "enableRateLimit": True,
-            "options": {"defaultType": "future", "adjustForTimeDifference": True},
+            "options": {
+                "defaultType": "spot",
+                "adjustForTimeDifference": True,
+                "createMarketBuyOrderRequiresPrice": False,
+            },
         }
     )
     exchange.enable_demo_trading(True)
@@ -55,21 +60,7 @@ def _key_hint() -> str:
     return f"{API_KEY[:4]}...{API_KEY[-4:]}"
 
 
-async def _calc_buy_amount(exchange, sym: str, target_usdt: float) -> tuple[float, float]:
-    ticker = await exchange.fetch_ticker(sym)
-    px = float(ticker["last"])
-    market = exchange.market(sym)
-    min_amt = float((market.get("limits") or {}).get("amount", {}).get("min") or 0.0001)
-    amount = float(exchange.amount_to_precision(sym, target_usdt / px))
-    for _ in range(30):
-        if amount * px >= target_usdt:
-            break
-        amount = float(exchange.amount_to_precision(sym, amount + min_amt))
-    return amount, px
-
-
 async def _confirm_order(exchange, sym: str, order_id: str) -> dict:
-    """Re-fetch order from Binance — create_order response can be incomplete."""
     for attempt in range(5):
         try:
             order = await exchange.fetch_order(order_id, sym)
@@ -80,14 +71,13 @@ async def _confirm_order(exchange, sym: str, order_id: str) -> dict:
                 raise
             print(f"  fetch_order retry {attempt + 1}: {exc}")
         await asyncio.sleep(0.5)
-    raise RuntimeError(f"Order {order_id} not confirmed on demo API")
+    raise RuntimeError(f"Order {order_id} not confirmed")
 
 
 async def _print_api_proof(exchange, sym: str, order_ids: list[str]) -> None:
     await asyncio.sleep(1.0)
-    print("API PROOF (demo-fapi.binance.com):")
-    print(f"  endpoint: {exchange.urls['api'].get('fapiPrivate')}")
-    print(f"  api key : {_key_hint()}  <- bunu Demo API Management ile eslestir")
+    print("API PROOF (api.binance.com spot):")
+    print(f"  api key : {_key_hint()}")
 
     for oid in order_ids:
         order = await exchange.fetch_order(oid, sym)
@@ -97,26 +87,13 @@ async def _print_api_proof(exchange, sym: str, order_ids: list[str]) -> None:
             f"filled={order.get('filled')} | avg={order.get('average')}"
         )
 
-    trades = await exchange.fetch_my_trades(sym, limit=10)
-    ours = [t for t in trades if str(t.get("order")) in order_ids]
-    if ours:
-        print("  TRADE HISTORY (UI -> Trade History sekmesi):")
-        for t in ours[-4:]:
-            print(
-                f"    {t.get('datetime')} | {t.get('side').upper()} | "
-                f"order={t.get('order')} | qty={t.get('amount')} | price={t.get('price')}"
-            )
-
 
 def _print_ui_help() -> None:
     print("-" * 60)
     print("BINANCE UI — emirleri gormek icin:")
-    print("  1) binance.com'a gir")
-    print("  2) Ustte WALLET / hesap menusunden DEMO TRADING moduna gec")
-    print("     (canli futures DEGIL — demo modu acik olmali)")
-    print("  3) Futures -> Positions (buy-only) veya Order History / Trade History")
-    print("  4) 'Hide Other Pairs' kapali olsun, filtre: 1 Day")
-    print("  5) API key eslesmesi: yukaridaki key hint = Demo API Management key")
+    print("  1) binance.com -> DEMO TRADING moduna gec")
+    print("  2) Spot -> Orders / Trade History / Wallet Spot")
+    print("  3) API key: Demo Trading API Management")
     print("-" * 60)
 
 
@@ -128,56 +105,48 @@ async def order_buy_only(exchange) -> None:
 
     bal = await exchange.fetch_balance()
     usdt = float((bal.get("USDT") or {}).get("free") or 0)
-    print(f"BUY-ONLY TEST | demo USDT free: {usdt:.2f}")
+    print(f"BUY-ONLY TEST | demo spot USDT free: {usdt:.2f}")
     if usdt < TEST_USDT:
-        print(f"FAIL: need >= {TEST_USDT:.0f} USDT on demo account")
+        print(f"FAIL: need >= {TEST_USDT:.0f} USDT on demo spot wallet")
         return
 
-    amount, px = await _calc_buy_amount(exchange, sym, TEST_USDT)
-    notional = amount * px
     print("-" * 60)
-    print(f"BUY ONLY | {sym} | target={TEST_USDT:.0f} USDT | qty={amount} (~{notional:.2f})")
-    raw = await exchange.create_order(sym, "market", "buy", amount)
+    print(f"BUY ONLY | {sym} | cost={TEST_USDT:.0f} USDT")
+    if hasattr(exchange, "create_market_buy_order_with_cost"):
+        raw = await exchange.create_market_buy_order_with_cost(sym, TEST_USDT)
+    else:
+        raw = await exchange.create_order(
+            sym, "market", "buy", TEST_USDT, params={"quoteOrderQty": TEST_USDT}
+        )
     buy = await _confirm_order(exchange, sym, str(raw["id"]))
     buy_id = str(buy["id"])
     filled = float(buy["filled"])
-    avg = float(buy["average"] or buy.get("price") or px)
+    avg = float(buy["average"] or buy.get("price") or 0)
     print(
         f"  OK | orderId={buy_id} | filled={filled} | avg={avg:.2f} | "
         f"~{filled * avg:.2f} USDT"
     )
 
-    positions = await exchange.fetch_positions([sym])
-    for p in positions:
-        contracts = float(p.get("contracts") or 0)
-        if contracts > 0:
-            print(
-                f"  POSITION OPEN | {sym} | contracts={contracts} | "
-                f"entry={p.get('entryPrice')} | pnl={p.get('unrealizedPnl')}"
-            )
+    bal2 = await exchange.fetch_balance()
+    btc = float((bal2.get("BTC") or {}).get("free") or 0)
+    print(f"  BTC free balance: {btc}")
 
     await _print_api_proof(exchange, sym, [buy_id])
     _print_ui_help()
-    print("SATMAK ICIN: Futures panelden manuel kapat veya:")
+    print("SATMAK ICIN: Spot'tan manuel sat veya:")
     print("  python test_bot.py --sell-only")
 
 
 async def order_sell_only(exchange) -> None:
     sym = TEST_SYMBOL
-    positions = await exchange.fetch_positions([sym])
-    amount = 0.0
-    for p in positions:
-        contracts = abs(float(p.get("contracts") or 0))
-        side = (p.get("side") or "").lower()
-        if contracts > 0 and side in ("long", "both", ""):
-            amount = contracts
-            break
+    bal = await exchange.fetch_balance()
+    amount = float((bal.get("BTC") or {}).get("free") or 0)
     if amount <= 0:
-        print("SELL-ONLY: acik BTC long pozisyon yok")
+        print("SELL-ONLY: free BTC yok")
         return
     amount = float(exchange.amount_to_precision(sym, amount))
     print(f"SELL ONLY | {sym} | qty={amount}")
-    raw = await exchange.create_order(sym, "market", "sell", amount, params={"reduceOnly": True})
+    raw = await exchange.create_order(sym, "market", "sell", amount)
     sell = await _confirm_order(exchange, sym, str(raw["id"]))
     print(f"  OK | orderId={sell['id']} | filled={sell['filled']}")
     await _print_api_proof(exchange, sym, [str(sell["id"])])
@@ -191,20 +160,23 @@ async def order_smoke_test(exchange, round_trip: bool = True) -> None:
 
     bal = await exchange.fetch_balance()
     usdt = float((bal.get("USDT") or {}).get("free") or 0)
-    print(f"ORDER TEST | demo USDT free: {usdt:.2f}")
+    print(f"ORDER TEST | spot USDT free: {usdt:.2f}")
     if usdt < TEST_USDT:
-        print(f"ORDER TEST skipped: need >= {TEST_USDT:.0f} USDT on demo account")
+        print(f"ORDER TEST skipped: need >= {TEST_USDT:.0f} USDT on spot wallet")
         return
 
-    amount, px = await _calc_buy_amount(exchange, sym, TEST_USDT)
-    notional = amount * px
     print("-" * 60)
-    print(f"BUY  | {sym} | target={TEST_USDT:.0f} USDT | qty={amount} (~{notional:.2f})")
-    raw_buy = await exchange.create_order(sym, "market", "buy", amount)
+    print(f"BUY  | {sym} | cost={TEST_USDT:.0f} USDT")
+    if hasattr(exchange, "create_market_buy_order_with_cost"):
+        raw_buy = await exchange.create_market_buy_order_with_cost(sym, TEST_USDT)
+    else:
+        raw_buy = await exchange.create_order(
+            sym, "market", "buy", TEST_USDT, params={"quoteOrderQty": TEST_USDT}
+        )
     buy = await _confirm_order(exchange, sym, str(raw_buy["id"]))
     buy_id = str(buy["id"])
     filled = float(buy["filled"])
-    buy_avg = float(buy["average"] or buy.get("price") or px)
+    buy_avg = float(buy["average"] or buy.get("price") or 0)
     print(
         f"  OK | orderId={buy_id} | filled={filled} | avg={buy_avg:.2f} | "
         f"~{filled * buy_avg:.2f} USDT"
@@ -212,35 +184,23 @@ async def order_smoke_test(exchange, round_trip: bool = True) -> None:
 
     order_ids = [buy_id]
     if round_trip:
-        filled = float(exchange.amount_to_precision(sym, filled))
-        print(f"SELL | {sym} | qty={filled} | reduceOnly")
-        raw_sell = await exchange.create_order(
-            sym, "market", "sell", filled, params={"reduceOnly": True}
-        )
-        sell = await _confirm_order(exchange, sym, str(raw_sell["id"]))
-        sell_id = str(sell["id"])
-        order_ids.append(sell_id)
-        print(f"  OK | orderId={sell_id} | filled={sell['filled']} | round-trip OK")
+        await asyncio.sleep(1.0)
+        bal2 = await exchange.fetch_balance()
+        free_btc = float((bal2.get("BTC") or {}).get("free") or 0)
+        sell_amt = float(exchange.amount_to_precision(sym, min(filled, free_btc)))
+        if sell_amt <= 0:
+            print(f"SELL skipped: free BTC={free_btc} filled={filled}")
+        else:
+            print(f"SELL | {sym} | qty={sell_amt} (free={free_btc})")
+            raw_sell = await exchange.create_order(sym, "market", "sell", sell_amt)
+            sell = await _confirm_order(exchange, sym, str(raw_sell["id"]))
+            sell_id = str(sell["id"])
+            order_ids.append(sell_id)
+            print(f"  OK | orderId={sell_id} | filled={sell['filled']} | round-trip OK")
 
     print(f"Order IDs: {', '.join(order_ids)}")
     await _print_api_proof(exchange, sym, order_ids)
     _print_ui_help()
-
-
-async def count_universe(exchange) -> list[str]:
-    selected: list[str] = []
-    for symbol, market in exchange.markets.items():
-        if not market.get("active", True):
-            continue
-        if market.get("quote") != "USDT":
-            continue
-        if not market.get("swap", False) and not market.get("linear", False):
-            continue
-        if market.get("settle") not in (None, "USDT"):
-            continue
-        selected.append(symbol)
-    selected.sort()
-    return selected
 
 
 async def warmup_sample(exchange, symbols: list[str], n: int = 8) -> dict:
@@ -296,35 +256,35 @@ async def main(
             await order_sell_only(exchange)
             return
         if buy_only:
-            print(f"DEMO API key: {_key_hint()}")
+            print(f"Demo Spot API key: {_key_hint()}")
             await order_buy_only(exchange)
             return
         if order_only:
-            print(f"DEMO API key: {_key_hint()}")
+            print(f"Demo Spot API key: {_key_hint()}")
             await order_smoke_test(exchange)
             return
 
         print("=" * 60)
-        print("FBB BOT - LIVE HEALTH CHECK (Binance DEMO)")
+        print("FBB BOT - LIVE HEALTH CHECK (Binance SPOT DEMO)")
         print("=" * 60)
         print(f"Filters: 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} | rel>={VOL_MULT}x")
         print(f"         candle>={MIN_CANDLE_PCT}% | notional={ORDER_USDT} USDT")
-        print("         exit: hard stop disaster / EMA9 5m close")
-        print(f"DEMO API key: {_key_hint()}")
+        print("         exit: entry-candle-low / EMA9 5m / trail")
+        print(f"Demo Spot API key: {_key_hint()}")
         print("-" * 60)
         print("OK  Markets loaded")
 
         try:
             bal = await exchange.fetch_balance()
             usdt = float((bal.get("USDT") or {}).get("free") or 0)
-            print(f"OK  API auth | demo USDT free: {usdt:.2f}")
+            print(f"OK  API auth | demo spot USDT free: {usdt:.2f}")
         except Exception as exc:  # noqa: BLE001
             print(f"FAIL API auth: {exc}")
-            print("TIP: API key must be from Demo Trading (binance.com -> Demo mode)")
+            print("TIP: API key must be from Demo Trading (binance.com → Demo mode)")
             return
 
-        symbols = await count_universe(exchange)
-        print(f"OK  Universe: {len(symbols)} USDT-M perpetual pairs (all active)")
+        symbols = list_spot_usdt_symbols(exchange.markets)
+        print(f"OK  Universe: {len(symbols)} spot USDT pairs")
 
         wh = await warmup_sample(exchange, symbols, n=8)
         print(f"OK  OHLCV warmup sample: {wh['ready']}/{wh['sample']} ready for FBB")
@@ -342,13 +302,13 @@ async def main(
 
         print("-" * 60)
         if order_test:
-            print("Running order smoke test (100 USDT BTC buy + sell)...")
+            print("Running order smoke test (~100 USDT BTC buy + sell)...")
             await order_smoke_test(exchange)
         else:
             print("Order tests:")
-            print("  python test_bot.py --buy-only     # sadece al, UI'da pozisyon gor")
+            print("  python test_bot.py --buy-only     # sadece al")
             print("  python test_bot.py --order-test   # al + sat round-trip")
-            print("  python test_bot.py --sell-only    # acik pozisyonu kapat")
+            print("  python test_bot.py --sell-only    # BTC sat")
 
         print("=" * 60)
         print("HEALTH CHECK DONE")
@@ -359,14 +319,14 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--order-test", action="store_true", help="100 USDT BTC buy+sell")
+    parser.add_argument("--order-test", action="store_true", help="~100 USDT BTC buy+sell")
     parser.add_argument("--order-only", action="store_true", help="Skip checks, run buy+sell test")
     parser.add_argument(
         "--buy-only",
         action="store_true",
-        help="100 USDT BTC buy only — open position visible in UI",
+        help="~100 USDT BTC buy only",
     )
-    parser.add_argument("--sell-only", action="store_true", help="Close open BTC demo position")
+    parser.add_argument("--sell-only", action="store_true", help="Sell free BTC")
     args = parser.parse_args()
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
