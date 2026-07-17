@@ -28,13 +28,17 @@ MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "4.0"))
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "2.5"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
 # Hybrid: sell PARTIAL_TP_FRAC at +PARTIAL_TP_PCT%, remainder rides EMA (trail optional)
-PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "5.0"))  # 0 = disabled
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))  # 0 = disabled
 PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.5"))
 USE_TRAIL = os.getenv("USE_TRAIL", "0").strip().lower() in ("1", "true", "yes")
+# Runner EMA timeframe: "1m" or "5m"
+EMA_EXIT_TF = os.getenv("EMA_EXIT_TF", "1m").strip().lower()
+if EMA_EXIT_TF not in ("1m", "5m"):
+    EMA_EXIT_TF = "1m"
 
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
@@ -201,16 +205,27 @@ def trail_stop_hit(
 def ema_exit_signal(
     ohlcv_1m: list[list[float]],
 ) -> tuple[bool, float, float, str]:
-    bars_5m = aggregate_ohlcv(ohlcv_1m, EXIT_TF_MS)
-    if len(bars_5m) < EMA_PERIOD:
-        return False, 0.0, 0.0, ""
-    closes = np.asarray([float(b[4]) for b in bars_5m], dtype=float)
-    ema = ema_series(closes, EMA_PERIOD)
-    bar_close = float(bars_5m[-1][4])
-    ema_val = float(ema[-1])
+    """Exit when last closed bar of EMA_EXIT_TF closes below EMA9."""
+    if EMA_EXIT_TF == "1m":
+        if len(ohlcv_1m) < EMA_PERIOD:
+            return False, 0.0, 0.0, ""
+        closes = np.asarray([float(b[4]) for b in ohlcv_1m], dtype=float)
+        ema = ema_series(closes, EMA_PERIOD)
+        bar_close = float(closes[-1])
+        ema_val = float(ema[-1])
+        tf_label = "1m"
+    else:
+        bars = aggregate_ohlcv(ohlcv_1m, EXIT_TF_MS)
+        if len(bars) < EMA_PERIOD:
+            return False, 0.0, 0.0, ""
+        closes = np.asarray([float(b[4]) for b in bars], dtype=float)
+        ema = ema_series(closes, EMA_PERIOD)
+        bar_close = float(bars[-1][4])
+        ema_val = float(ema[-1])
+        tf_label = "5m"
     if bar_close >= ema_val:
         return False, bar_close, ema_val, ""
-    reason = f"EMA{EMA_PERIOD} 5m close {bar_close:.8f} < {ema_val:.8f}"
+    reason = f"EMA{EMA_PERIOD} {tf_label} close {bar_close:.8f} < {ema_val:.8f}"
     return True, bar_close, ema_val, reason
 
 

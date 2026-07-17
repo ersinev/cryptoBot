@@ -9,8 +9,8 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
 
 Exit:
   - Stop: entry 1m candle low (structure)
-  - Scale-out: PARTIAL_TP_FRAC at +PARTIAL_TP_PCT% (default 50% @ +5%)
-  - Runner: 5m close below EMA9 (trail only if USE_TRAIL=1)
+  - Scale-out: PARTIAL_TP_FRAC at +PARTIAL_TP_PCT% (default 50% @ +3%)
+  - Runner: 1m close below EMA9 (EMA_EXIT_TF=1m; trail only if USE_TRAIL=1)
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from indicators import fibonacci_bollinger
 from markets import list_spot_usdt_symbols
 from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
+    EMA_EXIT_TF,
     EMA_PERIOD,
     EXIT_TF_MS,
     FBB_LENGTH,
@@ -181,10 +182,11 @@ class FBBInstantBreakoutBot:
         )
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
-            "exit entry-candle-low / %sEMA%d 5m (%s) | telegram=%s",
+            "exit entry-candle-low / %sEMA%d %s (%s) | telegram=%s",
             ORDER_USDT,
             partial_txt,
             EMA_PERIOD,
+            EMA_EXIT_TF,
             trail_txt,
             "ON" if telegram_enabled() else "OFF",
         )
@@ -420,7 +422,9 @@ class FBBInstantBreakoutBot:
             for sym in list(self.positions.keys()):
                 await self._fetch_and_apply_ohlcv(sym)
 
-            if five_m_closed and self.positions:
+            # EMA runner: every 1m close, or only on 5m close if EMA_EXIT_TF=5m
+            check_ema = EMA_EXIT_TF == "1m" or five_m_closed
+            if check_ema and self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
 
@@ -563,16 +567,21 @@ class FBBInstantBreakoutBot:
         if state is None or not state.ohlcv:
             return
 
-        series = ohlcv_with_active(
-            state.ohlcv,
-            state.candle_ts,
-            state.open,
-            state.high,
-            state.low,
-            state.close,
-            state.volume,
-        )
-        if len(series) < 2 or not five_m_just_closed(series, len(series) - 1):
+        # Closed 1m bars only (no active wick) for EMA decision
+        series = state.ohlcv
+        if EMA_EXIT_TF == "5m":
+            series = ohlcv_with_active(
+                state.ohlcv,
+                state.candle_ts,
+                state.open,
+                state.high,
+                state.low,
+                state.close,
+                state.volume,
+            )
+            if len(series) < 2 or not five_m_just_closed(series, len(series) - 1):
+                return
+        elif len(series) < EMA_PERIOD:
             return
 
         pos = self.positions.get(symbol)
