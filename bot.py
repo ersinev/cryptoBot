@@ -180,9 +180,11 @@ class FBBInstantBreakoutBot:
         )
         partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
         if EMA_PROGRESSIVE:
-            ema_cfg = (
-                "prog 1m->3m" if EMA_PROG_MODE == "1m3m" else "prog 1m->3m->5m"
-            )
+            ema_cfg = {
+                "1m2m": "prog 1m->2m",
+                "1m3m": "prog 1m->3m",
+                "1m3m5m": "prog 1m->3m->5m",
+            }.get(EMA_PROG_MODE, f"prog {EMA_PROG_MODE}")
         else:
             ema_cfg = EMA_EXIT_TF
         log.info(
@@ -576,7 +578,7 @@ class FBBInstantBreakoutBot:
             else EMA_EXIT_TF
         )
         series = state.ohlcv
-        if ema_tf in ("3m", "5m"):
+        if ema_tf in ("2m", "3m", "5m"):
             series = ohlcv_with_active(
                 state.ohlcv,
                 state.candle_ts,

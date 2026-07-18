@@ -27,15 +27,19 @@ VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "2.5"))
-TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "10.0"))
+TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
 # Legacy single-step (unused if PARTIAL_LADDER set)
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))
 PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.3"))
 USE_TRAIL = os.getenv("USE_TRAIL", "1").strip().lower() in ("1", "true", "yes")
-# Runner EMA timeframe: "1m", "3m", or "5m"
-# EMA_PROGRESSIVE=1 → <first ladder%: 1m, then 3m, after 2nd ladder%: 5m
-_EMA_TF_MS = {"1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000}
+# Runner EMA timeframe: "1m", "2m", "3m", or "5m"
+_EMA_TF_MS = {
+    "1m": 60_000,
+    "2m": 2 * 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+}
 EMA_EXIT_TF = os.getenv("EMA_EXIT_TF", "5m").strip().lower()
 if EMA_EXIT_TF not in _EMA_TF_MS:
     EMA_EXIT_TF = "5m"
@@ -47,10 +51,10 @@ EMA_PROGRESSIVE = os.getenv("EMA_PROGRESSIVE", "1").strip().lower() in (
     "true",
     "yes",
 )
-# progressive ladder: "1m3m" (<3→1m, ≥3→3m) or "1m3m5m" (<3→1m, ≥3→3m, ≥5→5m)
-EMA_PROG_MODE = os.getenv("EMA_PROG_MODE", "1m3m").strip().lower()
-if EMA_PROG_MODE not in ("1m3m5m", "1m3m"):
-    EMA_PROG_MODE = "1m3m"
+# progressive: "1m2m" | "1m3m" | "1m3m5m"
+EMA_PROG_MODE = os.getenv("EMA_PROG_MODE", "1m2m").strip().lower()
+if EMA_PROG_MODE not in ("1m3m5m", "1m3m", "1m2m"):
+    EMA_PROG_MODE = "1m2m"
 
 
 def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
@@ -122,8 +126,9 @@ def ema_tf_ms(tf: str) -> int:
 def runner_ema_tf(entry: float, high_water: float) -> str:
     """
     Progressive runner EMA (EMA_PROGRESSIVE=1):
+      1m2m:   MFE < +3% → 1m | >= +3% → 2m
+      1m3m:   MFE < +3% → 1m | >= +3% → 3m
       1m3m5m: MFE < +3% → 1m | +3%..+5% → 3m | >= +5% → 5m
-      1m3m:   MFE < +3% → 1m | >= +3% → 3m  (no 5m)
     Thresholds follow PARTIAL_LADDER levels when present.
     Fixed mode (EMA_PROGRESSIVE=0) always returns EMA_EXIT_TF.
     """
@@ -134,6 +139,8 @@ def runner_ema_tf(entry: float, high_water: float) -> str:
     mfe_pct = (high_water / entry - 1.0) * 100.0
     t_lo = PARTIAL_LADDER[0][0] if PARTIAL_LADDER else 3.0
     t_hi = PARTIAL_LADDER[1][0] if len(PARTIAL_LADDER) > 1 else 5.0
+    if EMA_PROG_MODE == "1m2m":
+        return "2m" if mfe_pct >= t_lo else "1m"
     if EMA_PROG_MODE == "1m3m":
         return "3m" if mfe_pct >= t_lo else "1m"
     if mfe_pct >= t_hi:
