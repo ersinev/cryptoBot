@@ -267,11 +267,14 @@ def run_backtest(
             else "no trail"
         )
         if EMA_PROGRESSIVE:
-            ema_txt = (
-                f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->3m)"
-                if EMA_PROG_MODE == "1m3m"
-                else f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->3m, >=5%->5m)"
-            )
+            ema_txt = {
+                "1m2m": f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->2m)",
+                "1m3m": f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->3m)",
+                "1m3m5m": (
+                    f"EMA{EMA_PERIOD} progressive "
+                    f"(<3%->1m, >=3%->3m, >=5%->5m)"
+                ),
+            }.get(EMA_PROG_MODE, f"EMA{EMA_PERIOD} progressive {EMA_PROG_MODE}")
         else:
             ema_txt = f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
         print(
@@ -447,11 +450,11 @@ def print_symbol_summary(
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
     print("Armed       : grey dip persists until FBB 0.786 break")
     if EMA_PROGRESSIVE:
-        ema_bit = (
-            f"EMA{EMA_PERIOD} prog 1m->3m"
-            if EMA_PROG_MODE == "1m3m"
-            else f"EMA{EMA_PERIOD} prog 1m->3m->5m"
-        )
+        ema_bit = {
+            "1m2m": f"EMA{EMA_PERIOD} prog 1m->2m",
+            "1m3m": f"EMA{EMA_PERIOD} prog 1m->3m",
+            "1m3m5m": f"EMA{EMA_PERIOD} prog 1m->3m->5m",
+        }.get(EMA_PROG_MODE, f"EMA{EMA_PERIOD} prog {EMA_PROG_MODE}")
     else:
         ema_bit = f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
     print(

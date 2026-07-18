@@ -10,8 +10,8 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
 Exit:
   - Stop: entry 1m candle low (structure)
   - Ladder: PARTIAL_LADDER e.g. 40%@+3% then 30%@+5%
-  - Until +TRAIL_ACTIVATE_PCT%: EMA9 progressive (<3% 1m, >=3% 3m) or fixed EMA_EXIT_TF
-  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high (default +10% / -3%)
+  - Until +TRAIL_ACTIVATE_PCT%: EMA9 progressive (<3% 1m, >=3% 2m) or fixed EMA_EXIT_TF
+  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high (default +5% / -3%)
 """
 from __future__ import annotations
 
