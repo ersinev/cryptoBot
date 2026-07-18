@@ -22,6 +22,8 @@ from markets import list_spot_usdt_symbols
 from strategy import (
     EMA_EXIT_TF,
     EMA_PERIOD,
+    EMA_PROG_MODE,
+    EMA_PROGRESSIVE,
     EXIT_TF_MS,
     FBB_LENGTH,
     FBB_MULT,
@@ -40,10 +42,11 @@ from strategy import (
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_fill_price,
-    five_m_just_closed,
     ladder_label,
     next_ladder_partial,
     prev_candle_quote_ok,
+    runner_ema_tf,
+    tf_just_closed,
     trail_should_arm,
     trail_stop_hit,
     update_armed,
@@ -263,8 +266,16 @@ def run_backtest(
             if USE_TRAIL
             else "no trail"
         )
+        if EMA_PROGRESSIVE:
+            ema_txt = (
+                f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->3m)"
+                if EMA_PROG_MODE == "1m3m"
+                else f"EMA{EMA_PERIOD} progressive (<3%->1m, >=3%->3m, >=5%->5m)"
+            )
+        else:
+            ema_txt = f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
         print(
-            f"Exit: entry-candle-low | {partial_txt}EMA{EMA_PERIOD} {EMA_EXIT_TF} "
+            f"Exit: entry-candle-low | {partial_txt}{ema_txt} "
             f"until trail ({trail_txt})\n"
         )
         print("-" * 72)
@@ -323,10 +334,10 @@ def run_backtest(
                 _close_pos(ts, fill, reason)
                 continue
 
-            check_ema = EMA_EXIT_TF == "1m" or five_m_just_closed(ohlcv, i)
-            if not trail_armed and check_ema:
+            ema_tf = runner_ema_tf(entry_price, high_water)
+            if not trail_armed and tf_just_closed(ohlcv, i, ema_tf):
                 should_exit, bar_close, ema_val, reason = ema_exit_signal(
-                    ohlcv[: i + 1]
+                    ohlcv[: i + 1], tf=ema_tf
                 )
                 if should_exit:
                     if any(ladder_done):
@@ -435,10 +446,18 @@ def print_symbol_summary(
     print(f"1m vol min : prev closed >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
     print("Armed       : grey dip persists until FBB 0.786 break")
+    if EMA_PROGRESSIVE:
+        ema_bit = (
+            f"EMA{EMA_PERIOD} prog 1m->3m"
+            if EMA_PROG_MODE == "1m3m"
+            else f"EMA{EMA_PERIOD} prog 1m->3m->5m"
+        )
+    else:
+        ema_bit = f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
     print(
         f"Exit        : entry-candle-low | "
         f"{(ladder_label() + ' + ') if PARTIAL_LADDER else ''}"
-        f"EMA{EMA_PERIOD} {EMA_EXIT_TF}"
+        f"{ema_bit}"
         f"{'' if not USE_TRAIL else f' / +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%'}"
     )
 
@@ -674,7 +693,9 @@ async def main() -> None:
             f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m FBB 0.786 break | "
             f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
             f"candle>={MIN_CANDLE_PCT}% | "
-            f"exit entry-candle-low / {partial_bit}EMA{EMA_PERIOD} {EMA_EXIT_TF}{trail_bit} | "
+            f"exit entry-candle-low / {partial_bit}"
+            f"{'EMA'+str(EMA_PERIOD)+' prog' if EMA_PROGRESSIVE else 'EMA'+str(EMA_PERIOD)+' '+EMA_EXIT_TF}"
+            f"{trail_bit} | "
             f"notional {ORDER_USDT} USDT"
         )
         print("-" * 72)

@@ -34,6 +34,7 @@ PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))
 PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.3"))
 USE_TRAIL = os.getenv("USE_TRAIL", "1").strip().lower() in ("1", "true", "yes")
 # Runner EMA timeframe: "1m", "3m", or "5m"
+# EMA_PROGRESSIVE=1 → <first ladder%: 1m, then 3m, after 2nd ladder%: 5m
 _EMA_TF_MS = {"1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000}
 EMA_EXIT_TF = os.getenv("EMA_EXIT_TF", "5m").strip().lower()
 if EMA_EXIT_TF not in _EMA_TF_MS:
@@ -41,6 +42,15 @@ if EMA_EXIT_TF not in _EMA_TF_MS:
 EMA_EXIT_TF_MS = _EMA_TF_MS[EMA_EXIT_TF]
 EXIT_TIMEFRAME = EMA_EXIT_TF
 EXIT_TF_MS = EMA_EXIT_TF_MS
+EMA_PROGRESSIVE = os.getenv("EMA_PROGRESSIVE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# progressive ladder: "1m3m" (<3→1m, ≥3→3m) or "1m3m5m" (<3→1m, ≥3→3m, ≥5→5m)
+EMA_PROG_MODE = os.getenv("EMA_PROG_MODE", "1m3m").strip().lower()
+if EMA_PROG_MODE not in ("1m3m5m", "1m3m"):
+    EMA_PROG_MODE = "1m3m"
 
 
 def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
@@ -105,15 +115,49 @@ def aggregate_ohlcv(ohlcv: list[list[float]], bucket_ms: int) -> list[list[float
     return out
 
 
-def ema_tf_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
-    """True when the current 1m bar is the last bar of an EMA_EXIT_TF bucket."""
-    if EMA_EXIT_TF == "1m":
+def ema_tf_ms(tf: str) -> int:
+    return _EMA_TF_MS.get(tf, EMA_EXIT_TF_MS)
+
+
+def runner_ema_tf(entry: float, high_water: float) -> str:
+    """
+    Progressive runner EMA (EMA_PROGRESSIVE=1):
+      1m3m5m: MFE < +3% → 1m | +3%..+5% → 3m | >= +5% → 5m
+      1m3m:   MFE < +3% → 1m | >= +3% → 3m  (no 5m)
+    Thresholds follow PARTIAL_LADDER levels when present.
+    Fixed mode (EMA_PROGRESSIVE=0) always returns EMA_EXIT_TF.
+    """
+    if not EMA_PROGRESSIVE:
+        return EMA_EXIT_TF
+    if entry <= 0 or high_water <= 0:
+        return "1m"
+    mfe_pct = (high_water / entry - 1.0) * 100.0
+    t_lo = PARTIAL_LADDER[0][0] if PARTIAL_LADDER else 3.0
+    t_hi = PARTIAL_LADDER[1][0] if len(PARTIAL_LADDER) > 1 else 5.0
+    if EMA_PROG_MODE == "1m3m":
+        return "3m" if mfe_pct >= t_lo else "1m"
+    if mfe_pct >= t_hi:
+        return "5m"
+    if mfe_pct >= t_lo:
+        return "3m"
+    return "1m"
+
+
+def tf_just_closed(ohlcv: list[list[float]], idx: int, tf: str) -> bool:
+    """True when the current 1m bar is the last bar of `tf` bucket."""
+    if tf == "1m":
         return True
+    bucket = ema_tf_ms(tf)
     ts = int(ohlcv[idx][0])
     if idx + 1 >= len(ohlcv):
         return True
     next_ts = int(ohlcv[idx + 1][0])
-    return (ts // EMA_EXIT_TF_MS) != (next_ts // EMA_EXIT_TF_MS)
+    return (ts // bucket) != (next_ts // bucket)
+
+
+def ema_tf_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
+    """True when the current 1m bar is the last bar of an EMA_EXIT_TF bucket."""
+    return tf_just_closed(ohlcv, idx, EMA_EXIT_TF)
 
 
 def five_m_just_closed(ohlcv: list[list[float]], idx: int) -> bool:
@@ -265,9 +309,13 @@ def trail_stop_hit(
 
 def ema_exit_signal(
     ohlcv_1m: list[list[float]],
+    tf: str | None = None,
 ) -> tuple[bool, float, float, str]:
-    """Exit when last closed bar of EMA_EXIT_TF closes below EMA9."""
-    if EMA_EXIT_TF == "1m":
+    """Exit when last closed bar of `tf` (or EMA_EXIT_TF) closes below EMA9."""
+    use_tf = tf or EMA_EXIT_TF
+    if use_tf not in _EMA_TF_MS:
+        use_tf = EMA_EXIT_TF
+    if use_tf == "1m":
         if len(ohlcv_1m) < EMA_PERIOD:
             return False, 0.0, 0.0, ""
         closes = np.asarray([float(b[4]) for b in ohlcv_1m], dtype=float)
@@ -275,7 +323,7 @@ def ema_exit_signal(
         bar_close = float(closes[-1])
         ema_val = float(ema[-1])
     else:
-        bars = aggregate_ohlcv(ohlcv_1m, EMA_EXIT_TF_MS)
+        bars = aggregate_ohlcv(ohlcv_1m, ema_tf_ms(use_tf))
         if len(bars) < EMA_PERIOD:
             return False, 0.0, 0.0, ""
         closes = np.asarray([float(b[4]) for b in bars], dtype=float)
@@ -284,9 +332,7 @@ def ema_exit_signal(
         ema_val = float(ema[-1])
     if bar_close >= ema_val:
         return False, bar_close, ema_val, ""
-    reason = (
-        f"EMA{EMA_PERIOD} {EMA_EXIT_TF} close {bar_close:.8f} < {ema_val:.8f}"
-    )
+    reason = f"EMA{EMA_PERIOD} {use_tf} close {bar_close:.8f} < {ema_val:.8f}"
     return True, bar_close, ema_val, reason
 
 

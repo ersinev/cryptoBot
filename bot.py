@@ -10,7 +10,7 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
 Exit:
   - Stop: entry 1m candle low (structure)
   - Ladder: PARTIAL_LADDER e.g. 30%@+3% then 30%@+5%
-  - Until +TRAIL_ACTIVATE_PCT%: EMA9 on EMA_EXIT_TF (default 5m)
+  - Until +TRAIL_ACTIVATE_PCT%: EMA9 progressive (<3% 1m, >=3% 3m) or fixed EMA_EXIT_TF
   - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high (default +10% / -3%)
 """
 from __future__ import annotations
@@ -35,7 +35,8 @@ from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
     EMA_EXIT_TF,
     EMA_PERIOD,
-    EXIT_TF_MS,
+    EMA_PROG_MODE,
+    EMA_PROGRESSIVE,
     FBB_LENGTH,
     FBB_MULT,
     MIN_CANDLE_PCT,
@@ -52,10 +53,11 @@ from strategy import (
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_rules_met,
-    five_m_just_closed,
     ladder_label,
     next_ladder_partial,
     ohlcv_with_active,
+    runner_ema_tf,
+    tf_just_closed,
     trail_should_arm,
     trail_stop_hit,
     prev_candle_quote_ok,
@@ -177,13 +179,19 @@ class FBBInstantBreakoutBot:
             else "no trail"
         )
         partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
+        if EMA_PROGRESSIVE:
+            ema_cfg = (
+                "prog 1m->3m" if EMA_PROG_MODE == "1m3m" else "prog 1m->3m->5m"
+            )
+        else:
+            ema_cfg = EMA_EXIT_TF
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
             "exit entry-candle-low / %sEMA%d %s (%s) | telegram=%s",
             ORDER_USDT,
             partial_txt,
             EMA_PERIOD,
-            EMA_EXIT_TF,
+            ema_cfg,
             trail_txt,
             "ON" if telegram_enabled() else "OFF",
         )
@@ -414,16 +422,11 @@ class FBBInstantBreakoutBot:
 
             border_ts = (int(time.time() * 1000) // TIMEFRAME_MS) * TIMEFRAME_MS
             prev_border = border_ts - TIMEFRAME_MS
-            ema_bucket_closed = (prev_border // EXIT_TF_MS) != (
-                border_ts // EXIT_TF_MS
-            )
-
             for sym in list(self.positions.keys()):
                 await self._fetch_and_apply_ohlcv(sym)
 
-            # EMA runner: every 1m close, or on 3m/5m bucket close
-            check_ema = EMA_EXIT_TF == "1m" or ema_bucket_closed
-            if check_ema and self.positions:
+            # EMA runner: each 1m close; per-position TF decides if bucket closed
+            if self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
 
@@ -563,9 +566,17 @@ class FBBInstantBreakoutBot:
         if state is None or not state.ohlcv:
             return
 
-        # Closed 1m bars only (no active wick) for EMA decision
+        pos = self.positions.get(symbol)
+        if pos is not None and pos.trail_armed:
+            return
+
+        ema_tf = (
+            runner_ema_tf(pos.entry_price, pos.high_since_entry)
+            if pos is not None
+            else EMA_EXIT_TF
+        )
         series = state.ohlcv
-        if EMA_EXIT_TF in ("3m", "5m"):
+        if ema_tf in ("3m", "5m"):
             series = ohlcv_with_active(
                 state.ohlcv,
                 state.candle_ts,
@@ -575,16 +586,16 @@ class FBBInstantBreakoutBot:
                 state.close,
                 state.volume,
             )
-            if len(series) < 2 or not five_m_just_closed(series, len(series) - 1):
+            if len(series) < 2 or not tf_just_closed(
+                series, len(series) - 1, ema_tf
+            ):
                 return
         elif len(series) < EMA_PERIOD:
             return
 
-        pos = self.positions.get(symbol)
-        if pos is not None and pos.trail_armed:
-            return
-
-        should_exit, bar_close, ema_val, reason = ema_exit_signal(series)
+        should_exit, bar_close, ema_val, reason = ema_exit_signal(
+            series, tf=ema_tf
+        )
         if not should_exit:
             return
 
