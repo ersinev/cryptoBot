@@ -28,11 +28,30 @@ ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", "2.0"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", "5.0"))
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "3.0"))
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "2.0"))
 # Legacy single-step (unused if PARTIAL_LADDER set)
 PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))
 PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.3"))
 USE_TRAIL = os.getenv("USE_TRAIL", "1").strip().lower() in ("1", "true", "yes")
+# Hard stop below entry (0 = off). Replaces/alongside entry-candle-low.
+HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "1.5"))
+USE_ENTRY_CANDLE_STOP = os.getenv("USE_ENTRY_CANDLE_STOP", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# After first ladder partial: stop at entry * (1 + BREAKEVEN_PCT/100)
+USE_BREAKEVEN = os.getenv("USE_BREAKEVEN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+BREAKEVEN_PCT = float(os.getenv("BREAKEVEN_PCT", "0.3"))
+USE_EMA_EXIT = os.getenv("USE_EMA_EXIT", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Runner EMA timeframe: "1m", "2m", "3m", or "5m"
 _EMA_TF_MS = {
     "1m": 60_000,
@@ -46,7 +65,7 @@ if EMA_EXIT_TF not in _EMA_TF_MS:
 EMA_EXIT_TF_MS = _EMA_TF_MS[EMA_EXIT_TF]
 EXIT_TIMEFRAME = EMA_EXIT_TF
 EXIT_TF_MS = EMA_EXIT_TF_MS
-EMA_PROGRESSIVE = os.getenv("EMA_PROGRESSIVE", "1").strip().lower() in (
+EMA_PROGRESSIVE = os.getenv("EMA_PROGRESSIVE", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -73,7 +92,7 @@ def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
 
 
 PARTIAL_LADDER = _parse_partial_ladder(
-    os.getenv("PARTIAL_LADDER", "3:0.40,5:0.30")
+    os.getenv("PARTIAL_LADDER", "3:0.70")
 )
 if not PARTIAL_LADDER and PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0:
     PARTIAL_LADDER = [(PARTIAL_TP_PCT, PARTIAL_TP_FRAC)]
@@ -252,11 +271,35 @@ def price_entry_ready(
 
 def entry_candle_stop_hit(entry_candle_low: float, price: float) -> tuple[bool, float]:
     """Stop when price breaks below the entry 1m candle low (structure stop)."""
+    if not USE_ENTRY_CANDLE_STOP:
+        return False, 0.0
     if entry_candle_low <= 0:
         return False, 0.0
     if price > entry_candle_low:
         return False, 0.0
     return True, max(entry_candle_low, price)
+
+
+def hard_stop_hit(entry: float, price: float) -> tuple[bool, float]:
+    """Fixed %% stop below entry (HARD_STOP_PCT)."""
+    if HARD_STOP_PCT <= 0 or entry <= 0:
+        return False, 0.0
+    stop_px = entry * (1.0 - HARD_STOP_PCT / 100.0)
+    if price > stop_px:
+        return False, 0.0
+    return True, max(stop_px, price)
+
+
+def breakeven_stop_hit(
+    entry: float, price: float, *, armed: bool
+) -> tuple[bool, float]:
+    """After partial: exit if price <= entry * (1 + BREAKEVEN_PCT/100)."""
+    if not armed or entry <= 0:
+        return False, 0.0
+    stop_px = entry * (1.0 + BREAKEVEN_PCT / 100.0)
+    if price > stop_px:
+        return False, 0.0
+    return True, max(stop_px, price)
 
 
 def trail_should_arm(entry: float, high_water: float) -> bool:

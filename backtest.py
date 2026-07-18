@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from indicators import fibonacci_bollinger
 from markets import list_spot_usdt_symbols
 from strategy import (
+    BREAKEVEN_PCT,
+    USE_BREAKEVEN,
     EMA_EXIT_TF,
     EMA_PERIOD,
     EMA_PROG_MODE,
@@ -28,6 +30,7 @@ from strategy import (
     FBB_LENGTH,
     FBB_MULT,
     FEE_RATE,
+    HARD_STOP_PCT,
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     ORDER_USDT,
@@ -35,13 +38,17 @@ from strategy import (
     TIMEFRAME,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
+    USE_EMA_EXIT,
+    USE_ENTRY_CANDLE_STOP,
     USE_TRAIL,
     aggregate_ohlcv,
     broke_entry_line,
+    breakeven_stop_hit,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_fill_price,
+    hard_stop_hit,
     ladder_label,
     next_ladder_partial,
     prev_candle_quote_ok,
@@ -328,6 +335,19 @@ def run_backtest(
                     _close_pos(ts, fill, f"trail -{TRAIL_PCT}%")
                     continue
 
+            # After first partial: breakeven (+ optional cushion) before hard/EMA
+            if USE_BREAKEVEN and not trail_armed and any(ladder_done):
+                hit, fill = breakeven_stop_hit(entry_price, l, armed=True)
+                if hit:
+                    _close_pos(ts, fill, f"breakeven +{BREAKEVEN_PCT:g}%")
+                    continue
+
+            if not trail_armed and not any(ladder_done):
+                hit, fill = hard_stop_hit(entry_price, l)
+                if hit:
+                    _close_pos(ts, fill, f"hard stop -{HARD_STOP_PCT:g}%")
+                    continue
+
             hit, fill = entry_candle_stop_hit(entry_candle_low, l)
             if hit:
                 any_part = any(ladder_done)
@@ -337,16 +357,17 @@ def run_backtest(
                 _close_pos(ts, fill, reason)
                 continue
 
-            ema_tf = runner_ema_tf(entry_price, high_water)
-            if not trail_armed and tf_just_closed(ohlcv, i, ema_tf):
-                should_exit, bar_close, ema_val, reason = ema_exit_signal(
-                    ohlcv[: i + 1], tf=ema_tf
-                )
-                if should_exit:
-                    if any(ladder_done):
-                        reason = f"EMA runner | {reason}"
-                    _close_pos(ts, bar_close, reason)
-                    continue
+            if USE_EMA_EXIT:
+                ema_tf = runner_ema_tf(entry_price, high_water)
+                if not trail_armed and tf_just_closed(ohlcv, i, ema_tf):
+                    should_exit, bar_close, ema_val, reason = ema_exit_signal(
+                        ohlcv[: i + 1], tf=ema_tf
+                    )
+                    if should_exit:
+                        if any(ladder_done):
+                            reason = f"EMA runner | {reason}"
+                        _close_pos(ts, bar_close, reason)
+                        continue
 
         fbb = fibonacci_bollinger(closed, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:

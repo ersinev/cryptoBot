@@ -7,11 +7,11 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
   3) Previous closed 1m quote vol >= MIN_CANDLE_QUOTE_VOL (no rel filter)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
-Exit:
-  - Stop: entry 1m candle low (structure)
-  - Ladder: PARTIAL_LADDER e.g. 40%@+3% then 30%@+5%
-  - Until +TRAIL_ACTIVATE_PCT%: EMA9 progressive (<3% 1m, >=3% 2m) or fixed EMA_EXIT_TF
-  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high (default +5% / -3%)
+Exit (env-driven; default plan: hard -1.5 / 70%@+3 / BE+0.3 / trail +5/-2):
+  - HARD_STOP_PCT below entry (before first partial)
+  - Ladder PARTIAL_LADDER; optional USE_BREAKEVEN after first partial
+  - Optional entry-candle-low / USE_EMA_EXIT until trail
+  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high
 """
 from __future__ import annotations
 
@@ -33,12 +33,14 @@ from indicators import fibonacci_bollinger
 from markets import list_spot_usdt_symbols
 from notify import notify_buy, notify_sell, telegram_enabled
 from strategy import (
+    BREAKEVEN_PCT,
     EMA_EXIT_TF,
     EMA_PERIOD,
     EMA_PROG_MODE,
     EMA_PROGRESSIVE,
     FBB_LENGTH,
     FBB_MULT,
+    HARD_STOP_PCT,
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     OHLCV_LIMIT,
@@ -48,11 +50,16 @@ from strategy import (
     TIMEFRAME_MS,
     TRAIL_ACTIVATE_PCT,
     TRAIL_PCT,
+    USE_BREAKEVEN,
+    USE_EMA_EXIT,
+    USE_ENTRY_CANDLE_STOP,
     USE_TRAIL,
+    breakeven_stop_hit,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_rules_met,
+    hard_stop_hit,
     ladder_label,
     next_ladder_partial,
     ohlcv_with_active,
@@ -179,21 +186,32 @@ class FBBInstantBreakoutBot:
             else "no trail"
         )
         partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
-        if EMA_PROGRESSIVE:
-            ema_cfg = {
-                "1m2m": "prog 1m->2m",
-                "1m3m": "prog 1m->3m",
-                "1m3m5m": "prog 1m->3m->5m",
-            }.get(EMA_PROG_MODE, f"prog {EMA_PROG_MODE}")
+        hard_txt = f"hard -{HARD_STOP_PCT:g}% / " if HARD_STOP_PCT > 0 else ""
+        be_txt = (
+            f"BE +{BREAKEVEN_PCT:g}% / " if USE_BREAKEVEN else ""
+        )
+        entry_low_txt = "entry-low / " if USE_ENTRY_CANDLE_STOP else ""
+        if USE_EMA_EXIT:
+            if EMA_PROGRESSIVE:
+                ema_cfg = {
+                    "1m2m": "prog 1m->2m",
+                    "1m3m": "prog 1m->3m",
+                    "1m3m5m": "prog 1m->3m->5m",
+                }.get(EMA_PROG_MODE, f"prog {EMA_PROG_MODE}")
+            else:
+                ema_cfg = EMA_EXIT_TF
+            ema_txt = f"EMA{EMA_PERIOD} {ema_cfg} / "
         else:
-            ema_cfg = EMA_EXIT_TF
+            ema_txt = "no EMA / "
         log.info(
             "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
-            "exit entry-candle-low / %sEMA%d %s (%s) | telegram=%s",
+            "exit %s%s%s%s%s(%s) | telegram=%s",
             ORDER_USDT,
+            hard_txt,
+            be_txt,
+            entry_low_txt,
             partial_txt,
-            EMA_PERIOD,
-            ema_cfg,
+            ema_txt,
             trail_txt,
             "ON" if telegram_enabled() else "OFF",
         )
@@ -428,7 +446,7 @@ class FBBInstantBreakoutBot:
                 await self._fetch_and_apply_ohlcv(sym)
 
             # EMA runner: each 1m close; per-position TF decides if bucket closed
-            if self.positions:
+            if USE_EMA_EXIT and self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
 
@@ -562,6 +580,8 @@ class FBBInstantBreakoutBot:
                 state.broke_red = False
 
     async def _maybe_ema_exit(self, symbol: str) -> None:
+        if not USE_EMA_EXIT:
+            return
         if symbol not in self.positions:
             return
         state = self.states.get(symbol)
@@ -684,9 +704,26 @@ class FBBInstantBreakoutBot:
                 armed=pos.trail_armed,
             )
             reason = f"trail -{TRAIL_PCT}%"
+        if not hit and USE_BREAKEVEN and not pos.trail_armed and any(pos.ladder_done):
+            hit, stop_fill = breakeven_stop_hit(
+                pos.entry_price, price, armed=True
+            )
+            reason = f"breakeven +{BREAKEVEN_PCT:g}%"
+        if (
+            not hit
+            and not pos.trail_armed
+            and not any(pos.ladder_done)
+        ):
+            hit, stop_fill = hard_stop_hit(pos.entry_price, price)
+            reason = f"hard stop -{HARD_STOP_PCT:g}%"
         if not hit:
             hit, stop_fill = entry_candle_stop_hit(pos.entry_candle_low, price)
-            reason = "entry candle low"
+            if hit:
+                reason = (
+                    "entry candle low (runner)"
+                    if any(pos.ladder_done)
+                    else "entry candle low"
+                )
 
         if not hit:
             return
