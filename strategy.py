@@ -22,14 +22,14 @@ EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
-# Optional absolute chart BASE floor (0 = off). Prefer VOL_SPIKE_* on current candle.
+# Optional absolute chart BASE floor (0 = off).
 MIN_CANDLE_BASE_VOL = float(os.getenv("MIN_CANDLE_BASE_VOL", "0"))
-# Legacy USDT quote floor (used only when MIN_CANDLE_BASE_VOL <= 0 and spike off)
+# Prev closed 1m USDT quote floor (used when USE_VOL_SPIKE=0 and BASE floor off)
 MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
-# Current 1m candle BASE vol >= VOL_SPIKE_MULT * mean(prev VOL_SPIKE_LOOKBACK closed)
+# Optional: current 1m BASE >= VOL_SPIKE_MULT * mean(prev VOL_SPIKE_LOOKBACK)
 VOL_SPIKE_LOOKBACK = int(os.getenv("VOL_SPIKE_LOOKBACK", "5"))
 VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.0"))
-USE_VOL_SPIKE = os.getenv("USE_VOL_SPIKE", "1").strip().lower() in (
+USE_VOL_SPIKE = os.getenv("USE_VOL_SPIKE", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -45,7 +45,7 @@ PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "3.0"))
 PARTIAL_TP_FRAC = float(os.getenv("PARTIAL_TP_FRAC", "0.3"))
 USE_TRAIL = os.getenv("USE_TRAIL", "1").strip().lower() in ("1", "true", "yes")
 # Hard stop below entry (0 = off). Replaces/alongside entry-candle-low.
-HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "1.5"))
+HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "0.75"))
 USE_ENTRY_CANDLE_STOP = os.getenv("USE_ENTRY_CANDLE_STOP", "0").strip().lower() in (
     "1",
     "true",
@@ -103,7 +103,7 @@ def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
 
 
 PARTIAL_LADDER = _parse_partial_ladder(
-    os.getenv("PARTIAL_LADDER", "3:0.70")
+    os.getenv("PARTIAL_LADDER", "1:0.30,2:0.30")
 )
 if not PARTIAL_LADDER and PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0:
     PARTIAL_LADDER = [(PARTIAL_TP_PCT, PARTIAL_TP_FRAC)]

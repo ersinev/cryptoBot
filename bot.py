@@ -7,7 +7,7 @@ Entry (1m, instant on FBB 0.786 break — one band below red):
   3) Current 1m chart BASE vol >= VOL_SPIKE_MULT x avg(prev VOL_SPIKE_LOOKBACK)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
-Exit (env-driven; default plan: hard -1.5 / 70%@+3 / BE+0.3 / trail +5/-2):
+Exit (env-driven; default: hard -0.75 / 30%@+1 / 30%@+2 / BE+0.3 / trail +5/-2):
   - HARD_STOP_PCT below entry (before first partial)
   - Ladder PARTIAL_LADDER; optional USE_BREAKEVEN after first partial
   - Optional entry-candle-low / USE_EMA_EXIT until trail
