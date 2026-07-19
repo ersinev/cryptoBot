@@ -4,7 +4,7 @@ Fibonacci Bollinger Instant Breakout — Binance Spot
 Entry (1m, instant on FBB 0.786 break — one band below red):
   1) Grey dip arms (persists across candles until entry)
   2) Price breaks FBB upper 0.786 (wick/high)
-  3) Previous closed 1m chart BASE vol >= MIN_CANDLE_BASE_VOL (default 8M)
+  3) Current 1m chart BASE vol >= VOL_SPIKE_MULT x avg(prev VOL_SPIKE_LOOKBACK)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
 Exit (env-driven; default plan: hard -1.5 / 70%@+3 / BE+0.3 / trail +5/-2):
@@ -55,11 +55,15 @@ from strategy import (
     USE_EMA_EXIT,
     USE_ENTRY_CANDLE_STOP,
     USE_TRAIL,
+    USE_VOL_SPIKE,
+    VOL_SPIKE_LOOKBACK,
+    VOL_SPIKE_MULT,
     breakeven_stop_hit,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_rules_met,
+    entry_vol_ok,
     hard_stop_hit,
     ladder_label,
     next_ladder_partial,
@@ -68,7 +72,6 @@ from strategy import (
     tf_just_closed,
     trail_should_arm,
     trail_stop_hit,
-    prev_candle_vol_ok,
     price_entry_ready,
     update_armed,
 )
@@ -108,6 +111,7 @@ class SymbolState:
     ready: bool = False
     entry_armed: bool = False  # grey dip — persists until entry
     broke_red: bool = False  # one entry attempt per 1m candle (backtest parity)
+    vol_fetch_ms: int = 0  # throttle on-demand OHLCV for vol spike
 
 
 @dataclass
@@ -255,7 +259,11 @@ class FBBInstantBreakoutBot:
         for s in added:
             self.states.setdefault(s, SymbolState(symbol=s))
 
-        if MIN_CANDLE_BASE_VOL > 0:
+        if USE_VOL_SPIKE:
+            vol_txt = (
+                f"cur base>={VOL_SPIKE_MULT:g}x avg last {VOL_SPIKE_LOOKBACK}"
+            )
+        elif MIN_CANDLE_BASE_VOL > 0:
             vol_txt = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
         else:
             vol_txt = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
@@ -538,25 +546,23 @@ class FBBInstantBreakoutBot:
 
         candle_pct = candle_up_pct(state.open, state.high)
 
-        if not state.ohlcv:
+        # Fresh active-candle volume (chart BASE) before spike check
+        now_ms = int(self.exchange.milliseconds())
+        if now_ms - state.vol_fetch_ms >= 2000:
+            await self._fetch_and_apply_ohlcv(state.symbol)
+            state.vol_fetch_ms = now_ms
+
+        if len(state.ohlcv) < VOL_SPIKE_LOOKBACK:
             return
-        prev = state.ohlcv[-1]
-        vol_ok, vol_meas = prev_candle_vol_ok(float(prev[5]), float(prev[4]))
+        prev_bases = [float(c[5]) for c in state.ohlcv[-VOL_SPIKE_LOOKBACK:]]
+        prev_close = float(state.ohlcv[-1][4]) if state.ohlcv else 0.0
+        vol_ok, vol_log, _meas = entry_vol_ok(
+            float(state.volume),
+            prev_bases,
+            prev_close_price=prev_close,
+        )
         if not vol_ok:
-            if MIN_CANDLE_BASE_VOL > 0:
-                log.debug(
-                    "WAIT PREV VOL %s | prev 1m base %.0f (min %.0f chart)",
-                    state.symbol,
-                    vol_meas,
-                    MIN_CANDLE_BASE_VOL,
-                )
-            else:
-                log.debug(
-                    "WAIT PREV VOL %s | prev 1m quote %.0f (min %.0f)",
-                    state.symbol,
-                    vol_meas,
-                    MIN_CANDLE_QUOTE_VOL,
-                )
+            log.debug("WAIT VOL %s | %s", state.symbol, vol_log)
             return
 
         async with self._trade_lock:
@@ -570,10 +576,6 @@ class FBBInstantBreakoutBot:
             ):
                 return
             state.broke_red = True
-            if MIN_CANDLE_BASE_VOL > 0:
-                vol_log = f"prev_1m_base={vol_meas:.0f} (chart)"
-            else:
-                vol_log = f"prev_1m_vol={vol_meas:.0f} USDT"
             log.info(
                 "SIGNAL BUY %s | high=%.6f > entry0786=%.6f | red=%.6f | grey=%.6f | "
                 "%s | up=%.2f%% | low=%.6f open=%.6f",

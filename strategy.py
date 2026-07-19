@@ -22,11 +22,18 @@ EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
-# Chart-style 1m BASE volume (Binance candle volume units), prev closed bar.
-# Default 8M — matches chart "Volume" for cheap alts (not USDT quote).
-MIN_CANDLE_BASE_VOL = float(os.getenv("MIN_CANDLE_BASE_VOL", "8000000"))
-# Legacy USDT quote floor (used only when MIN_CANDLE_BASE_VOL <= 0)
+# Optional absolute chart BASE floor (0 = off). Prefer VOL_SPIKE_* on current candle.
+MIN_CANDLE_BASE_VOL = float(os.getenv("MIN_CANDLE_BASE_VOL", "0"))
+# Legacy USDT quote floor (used only when MIN_CANDLE_BASE_VOL <= 0 and spike off)
 MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
+# Current 1m candle BASE vol >= VOL_SPIKE_MULT * mean(prev VOL_SPIKE_LOOKBACK closed)
+VOL_SPIKE_LOOKBACK = int(os.getenv("VOL_SPIKE_LOOKBACK", "5"))
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.0"))
+USE_VOL_SPIKE = os.getenv("USE_VOL_SPIKE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
 VOL_MULT = float(os.getenv("VOL_MULT", "3.0"))
@@ -248,16 +255,70 @@ def prev_candle_quote_ok(base_vol: float, close_price: float) -> tuple[bool, flo
 
 def prev_candle_base_ok(base_vol: float) -> tuple[bool, float]:
     """Previous closed 1m BASE vol (chart Volume) >= MIN_CANDLE_BASE_VOL."""
+    if MIN_CANDLE_BASE_VOL <= 0:
+        return True, base_vol
     return base_vol >= MIN_CANDLE_BASE_VOL, base_vol
 
 
+def current_vol_spike_ok(
+    current_base_vol: float,
+    prev_closed_base_vols: list[float],
+    *,
+    lookback: int | None = None,
+    mult: float | None = None,
+) -> tuple[bool, float, float]:
+    """
+    Current candle chart BASE vol vs mean of previous N closed candles.
+    Returns (ok, ratio, avg_prev).
+    """
+    lb = VOL_SPIKE_LOOKBACK if lookback is None else lookback
+    m = VOL_SPIKE_MULT if mult is None else mult
+    if lb <= 0 or m <= 0:
+        return True, 0.0, 0.0
+    if len(prev_closed_base_vols) < lb:
+        return False, 0.0, 0.0
+    prev = prev_closed_base_vols[-lb:]
+    avg = sum(prev) / lb
+    if avg <= 0:
+        return False, 0.0, 0.0
+    ratio = current_base_vol / avg
+    return ratio >= m, ratio, avg
+
+
+def entry_vol_ok(
+    current_base_vol: float,
+    prev_closed_base_vols: list[float],
+    *,
+    prev_close_price: float = 0.0,
+) -> tuple[bool, str, float]:
+    """
+    Entry volume gate.
+    Default: current candle BASE >= VOL_SPIKE_MULT x avg(prev VOL_SPIKE_LOOKBACK).
+    Fallback (USE_VOL_SPIKE=0): prev closed absolute base/quote floors.
+    Returns (ok, log_label, measured).
+    """
+    if USE_VOL_SPIKE:
+        ok, ratio, avg = current_vol_spike_ok(
+            current_base_vol, prev_closed_base_vols
+        )
+        return (
+            ok,
+            f"cur_base={current_base_vol:.0f} avg{VOL_SPIKE_LOOKBACK}={avg:.0f} "
+            f"x{ratio:.2f} (need >={VOL_SPIKE_MULT:g}x)",
+            ratio,
+        )
+    if not prev_closed_base_vols:
+        return False, "no prev candle", 0.0
+    prev_base = float(prev_closed_base_vols[-1])
+    if MIN_CANDLE_BASE_VOL > 0:
+        ok, meas = prev_candle_base_ok(prev_base)
+        return ok, f"prev_1m_base={meas:.0f}", meas
+    ok, meas = prev_candle_quote_ok(prev_base, prev_close_price)
+    return ok, f"prev_1m_quote={meas:.0f}", meas
+
+
 def prev_candle_vol_ok(base_vol: float, close_price: float) -> tuple[bool, float]:
-    """
-    Entry volume gate on previous closed 1m candle.
-    Prefer chart-style BASE (>= MIN_CANDLE_BASE_VOL) when that env is > 0;
-    otherwise fall back to USDT quote (>= MIN_CANDLE_QUOTE_VOL).
-    Returns (ok, measured_vol) where measured_vol is base or quote accordingly.
-    """
+    """Legacy helper — prefer entry_vol_ok / current_vol_spike_ok."""
     if MIN_CANDLE_BASE_VOL > 0:
         return prev_candle_base_ok(base_vol)
     return prev_candle_quote_ok(base_vol, close_price)

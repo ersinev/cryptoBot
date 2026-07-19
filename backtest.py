@@ -42,6 +42,9 @@ from strategy import (
     USE_EMA_EXIT,
     USE_ENTRY_CANDLE_STOP,
     USE_TRAIL,
+    USE_VOL_SPIKE,
+    VOL_SPIKE_LOOKBACK,
+    VOL_SPIKE_MULT,
     aggregate_ohlcv,
     broke_entry_line,
     breakeven_stop_hit,
@@ -49,10 +52,10 @@ from strategy import (
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_fill_price,
+    entry_vol_ok,
     hard_stop_hit,
     ladder_label,
     next_ladder_partial,
-    prev_candle_vol_ok,
     runner_ema_tf,
     tf_just_closed,
     trail_should_arm,
@@ -264,7 +267,11 @@ def run_backtest(
 
     if verbose:
         print(f"\nRunning backtest on {n} closed 1m candles...\n")
-        if MIN_CANDLE_BASE_VOL > 0:
+        if USE_VOL_SPIKE:
+            vol_need = (
+                f"cur base>={VOL_SPIKE_MULT:g}x avg last {VOL_SPIKE_LOOKBACK}"
+            )
+        elif MIN_CANDLE_BASE_VOL > 0:
             vol_need = f"prev 1m base >= {MIN_CANDLE_BASE_VOL:.0f} (chart)"
         else:
             vol_need = f"prev 1m vol >= {MIN_CANDLE_QUOTE_VOL:.0f}"
@@ -392,12 +399,15 @@ def run_backtest(
             continue
         cnt_armed_break += 1
 
-        if not closed:
+        need = VOL_SPIKE_LOOKBACK if USE_VOL_SPIKE else 1
+        if len(closed) < need:
             skipped_vol += 1
             cnt_fail_vol_abs += 1
             continue
-        prev = closed[-1]
-        vol_pass, vol_meas = prev_candle_vol_ok(float(prev[5]), float(prev[4]))
+        prev_bases = [float(c[5]) for c in closed[-need:]]
+        vol_pass, vol_label, vol_meas = entry_vol_ok(
+            v, prev_bases, prev_close_price=float(closed[-1][4])
+        )
         if not vol_pass:
             skipped_vol += 1
             cnt_fail_vol_abs += 1
@@ -425,15 +435,11 @@ def run_backtest(
         in_pos = True
         armed = False
         if verbose:
-            if MIN_CANDLE_BASE_VOL > 0:
-                vol_s = f"prev_1m_base={vol_meas/1e6:.2f}M"
-            else:
-                vol_s = f"prev_1m_vol={vol_meas/1e3:.0f}K"
             print(
                 f"BUY  #{len(trades)+1:03d} | {ms_to_str(ts)} | "
                 f"price={fill:.8f} | grey={upper_0236:.8f} | "
                 f"entry0786={upper_0786:.8f} | red={upper_1000:.8f} | "
-                f"{vol_s} | "
+                f"{vol_label} | "
                 f"up={candle_pct:.2f}% | low={l:.8f} open={o:.8f}"
             )
 
@@ -446,7 +452,12 @@ def run_backtest(
     if verbose:
         print("\nFilter funnel:")
         print(f"  FBB armed persist + 0.786 break : {cnt_armed_break}")
-        if MIN_CANDLE_BASE_VOL > 0:
+        if USE_VOL_SPIKE:
+            print(
+                f"  fail cur vol spike   : {cnt_fail_vol_abs}  "
+                f"(need >={VOL_SPIKE_MULT:g}x avg last {VOL_SPIKE_LOOKBACK})"
+            )
+        elif MIN_CANDLE_BASE_VOL > 0:
             print(
                 f"  fail prev 1m base vol: {cnt_fail_vol_abs}  "
                 f"(need >= {MIN_CANDLE_BASE_VOL:.0f} chart)"
@@ -482,7 +493,12 @@ def print_symbol_summary(
     print(f"Candles    : {len(ohlcv)}")
     print(f"Trades     : {len(trades)}")
     print(f"Notional   : {ORDER_USDT} USDT / trade")
-    if MIN_CANDLE_BASE_VOL > 0:
+    if USE_VOL_SPIKE:
+        print(
+            f"1m vol min : cur base >={VOL_SPIKE_MULT:g}x avg last "
+            f"{VOL_SPIKE_LOOKBACK} (chart)"
+        )
+    elif MIN_CANDLE_BASE_VOL > 0:
         print(f"1m vol min : prev closed base >= {MIN_CANDLE_BASE_VOL:.0f} (chart)")
     else:
         print(f"1m vol min : prev closed >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
@@ -731,7 +747,11 @@ async def main() -> None:
             if USE_TRAIL
             else " / no trail"
         )
-        if MIN_CANDLE_BASE_VOL > 0:
+        if USE_VOL_SPIKE:
+            vol_bit = (
+                f"cur base>={VOL_SPIKE_MULT:g}x avg{VOL_SPIKE_LOOKBACK}"
+            )
+        elif MIN_CANDLE_BASE_VOL > 0:
             vol_bit = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
         else:
             vol_bit = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
