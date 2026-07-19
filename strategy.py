@@ -21,6 +21,16 @@ FBB_MULT = 3.0
 EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
+# "grid" | "fbb" — grid is the live experiment default
+STRATEGY = os.getenv("STRATEGY", "grid").strip().lower()
+if STRATEGY not in ("grid", "fbb"):
+    STRATEGY = "grid"
+
+# Grid %1: buy -step from anchor, TP +step, hard stop -(step*levels)
+GRID_STEP_PCT = float(os.getenv("GRID_STEP_PCT", "1.0"))
+GRID_STOP_LEVELS = float(os.getenv("GRID_STOP_LEVELS", "3"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
+
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
 # Optional absolute chart BASE floor (0 = off).
 MIN_CANDLE_BASE_VOL = float(os.getenv("MIN_CANDLE_BASE_VOL", "0"))
@@ -117,6 +127,47 @@ def ladder_label() -> str:
 
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
+GRID_OHLCV_LIMIT = 50
+
+
+def grid_should_buy(price: float, anchor: float, step_pct: float = GRID_STEP_PCT) -> bool:
+    return anchor > 0 and price > 0 and price <= anchor * (1.0 - step_pct / 100.0)
+
+
+def grid_ratchet_anchor(
+    price: float, anchor: float, step_pct: float = GRID_STEP_PCT
+) -> float:
+    """If price runs +step above anchor, move anchor up (don't chase buys)."""
+    if anchor <= 0 or price <= 0:
+        return anchor
+    if price >= anchor * (1.0 + step_pct / 100.0):
+        return price
+    return anchor
+
+
+def grid_tp_hit(
+    price: float, entry: float, step_pct: float = GRID_STEP_PCT
+) -> tuple[bool, float]:
+    if entry <= 0 or price <= 0:
+        return False, 0.0
+    target = entry * (1.0 + step_pct / 100.0)
+    if price >= target:
+        return True, price
+    return False, 0.0
+
+
+def grid_stop_hit(
+    price: float,
+    entry: float,
+    step_pct: float = GRID_STEP_PCT,
+    levels: float = GRID_STOP_LEVELS,
+) -> tuple[bool, float]:
+    if entry <= 0 or price <= 0:
+        return False, 0.0
+    stop = entry * (1.0 - step_pct / 100.0 * levels)
+    if price <= stop:
+        return True, price
+    return False, 0.0
 
 
 def aggregate_ohlcv(ohlcv: list[list[float]], bucket_ms: int) -> list[list[float]]:

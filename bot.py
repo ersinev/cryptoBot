@@ -1,17 +1,13 @@
 """
-Fibonacci Bollinger Instant Breakout — Binance Spot
+Binance Spot DEMO bot — STRATEGY=grid (default) or STRATEGY=fbb.
 
-Entry (1m, instant on FBB 0.786 break — one band below red):
-  1) Grey dip arms (persists across candles until entry)
-  2) Price breaks FBB upper 0.786 (wick/high)
-  3) Current 1m chart BASE vol >= VOL_SPIKE_MULT x avg(prev VOL_SPIKE_LOOKBACK)
-  4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
+Grid (default experiment):
+  Anchor starts at last close. Flat: buy if price <= anchor - GRID_STEP_PCT%;
+  if price >= anchor + step, ratchet anchor up (no chase).
+  Long: sell +step TP, or -(step*GRID_STOP_LEVELS) hard stop.
+  Max MAX_POSITIONS concurrent.
 
-Exit (env-driven; default: hard -0.75 / 30%@+0.5 / 30%@+2 / BE+0.3 / trail +5/-2):
-  - HARD_STOP_PCT below entry (before first partial)
-  - Ladder PARTIAL_LADDER; optional USE_BREAKEVEN after first partial
-  - Optional entry-candle-low / USE_EMA_EXIT until trail
-  - After +TRAIL_ACTIVATE%: trail TRAIL_PCT% from high
+FBB mode: classic Fibonacci Bollinger instant breakout + ladder/trail exits.
 """
 from __future__ import annotations
 
@@ -40,13 +36,18 @@ from strategy import (
     EMA_PROGRESSIVE,
     FBB_LENGTH,
     FBB_MULT,
+    GRID_OHLCV_LIMIT,
+    GRID_STEP_PCT,
+    GRID_STOP_LEVELS,
     HARD_STOP_PCT,
+    MAX_POSITIONS,
     MIN_CANDLE_BASE_VOL,
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     OHLCV_LIMIT,
     ORDER_USDT,
     PARTIAL_LADDER,
+    STRATEGY,
     TIMEFRAME,
     TIMEFRAME_MS,
     TRAIL_ACTIVATE_PCT,
@@ -64,6 +65,10 @@ from strategy import (
     entry_candle_stop_hit,
     entry_rules_met,
     entry_vol_ok,
+    grid_ratchet_anchor,
+    grid_should_buy,
+    grid_stop_hit,
+    grid_tp_hit,
     hard_stop_hit,
     ladder_label,
     next_ladder_partial,
@@ -92,7 +97,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("fbb-bot")
+log = logging.getLogger("spot-bot")
 
 
 @dataclass
@@ -112,6 +117,7 @@ class SymbolState:
     entry_armed: bool = False  # grey dip — persists until entry
     broke_red: bool = False  # one entry attempt per 1m candle (backtest parity)
     vol_fetch_ms: int = 0  # throttle on-demand OHLCV for vol spike
+    grid_anchor: float = 0.0  # grid reference price
 
 
 @dataclass
@@ -180,46 +186,59 @@ class FBBInstantBreakoutBot:
             log.warning("Exchange close error: %s", exc)
 
     async def run(self) -> None:
-        log.info("Starting FBB Instant Breakout bot (Binance SPOT DEMO)")
+        log.info(
+            "Starting spot bot | STRATEGY=%s | Binance SPOT DEMO",
+            STRATEGY,
+        )
         self.exchange.enable_demo_trading(True)
         await self.exchange.load_markets()
         await self.refresh_symbols()
         await self.warmup_all()
-        trail_txt = (
-            f"then +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
-            if USE_TRAIL
-            else "no trail"
-        )
-        partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
-        hard_txt = f"hard -{HARD_STOP_PCT:g}% / " if HARD_STOP_PCT > 0 else ""
-        be_txt = (
-            f"BE +{BREAKEVEN_PCT:g}% / " if USE_BREAKEVEN else ""
-        )
-        entry_low_txt = "entry-low / " if USE_ENTRY_CANDLE_STOP else ""
-        if USE_EMA_EXIT:
-            if EMA_PROGRESSIVE:
-                ema_cfg = {
-                    "1m2m": "prog 1m->2m",
-                    "1m3m": "prog 1m->3m",
-                    "1m3m5m": "prog 1m->3m->5m",
-                }.get(EMA_PROG_MODE, f"prog {EMA_PROG_MODE}")
-            else:
-                ema_cfg = EMA_EXIT_TF
-            ema_txt = f"EMA{EMA_PERIOD} {ema_cfg} / "
+        if STRATEGY == "grid":
+            log.info(
+                "Config: GRID | %s USDT/trade | step=%.2f%% | stop=-%.2f%% "
+                "(%g levels) | max_pos=%d | telegram=%s",
+                ORDER_USDT,
+                GRID_STEP_PCT,
+                GRID_STEP_PCT * GRID_STOP_LEVELS,
+                GRID_STOP_LEVELS,
+                MAX_POSITIONS,
+                "ON" if telegram_enabled() else "OFF",
+            )
         else:
-            ema_txt = "no EMA / "
-        log.info(
-            "Config: %s USDT/trade | spot DEMO | 1m break FBB 0.786 | "
-            "exit %s%s%s%s%s(%s) | telegram=%s",
-            ORDER_USDT,
-            hard_txt,
-            be_txt,
-            entry_low_txt,
-            partial_txt,
-            ema_txt,
-            trail_txt,
-            "ON" if telegram_enabled() else "OFF",
-        )
+            trail_txt = (
+                f"then +{TRAIL_ACTIVATE_PCT:.0f}% trail -{TRAIL_PCT:.0f}%"
+                if USE_TRAIL
+                else "no trail"
+            )
+            partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
+            hard_txt = f"hard -{HARD_STOP_PCT:g}% / " if HARD_STOP_PCT > 0 else ""
+            be_txt = f"BE +{BREAKEVEN_PCT:g}% / " if USE_BREAKEVEN else ""
+            entry_low_txt = "entry-low / " if USE_ENTRY_CANDLE_STOP else ""
+            if USE_EMA_EXIT:
+                if EMA_PROGRESSIVE:
+                    ema_cfg = {
+                        "1m2m": "prog 1m->2m",
+                        "1m3m": "prog 1m->3m",
+                        "1m3m5m": "prog 1m->3m->5m",
+                    }.get(EMA_PROG_MODE, f"prog {EMA_PROG_MODE}")
+                else:
+                    ema_cfg = EMA_EXIT_TF
+                ema_txt = f"EMA{EMA_PERIOD} {ema_cfg} / "
+            else:
+                ema_txt = "no EMA / "
+            log.info(
+                "Config: FBB | %s USDT/trade | 1m break FBB 0.786 | "
+                "exit %s%s%s%s%s(%s) | telegram=%s",
+                ORDER_USDT,
+                hard_txt,
+                be_txt,
+                entry_low_txt,
+                partial_txt,
+                ema_txt,
+                trail_txt,
+                "ON" if telegram_enabled() else "OFF",
+            )
 
         tasks = [
             asyncio.create_task(self._ticker_loop(), name="tickers"),
@@ -228,12 +247,20 @@ class FBBInstantBreakoutBot:
             asyncio.create_task(self._candle_boundary_loop(), name="candles"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
         ]
-        log.info(
-            "Live scan ON | %d spot coins websocket | armed persist | FBB refresh %ds | "
-            "prev-candle vol (local, no REST on signal)",
-            len(self.symbols),
-            FBB_REFRESH_SEC,
-        )
+        if STRATEGY == "grid":
+            log.info(
+                "Live scan ON | %d coins | GRID -%.2f%% buy / +%.2f%% sell | max %d pos",
+                len(self.symbols),
+                GRID_STEP_PCT,
+                GRID_STEP_PCT,
+                MAX_POSITIONS,
+            )
+        else:
+            log.info(
+                "Live scan ON | %d spot coins websocket | armed persist | FBB refresh %ds",
+                len(self.symbols),
+                FBB_REFRESH_SEC,
+            )
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -259,23 +286,33 @@ class FBBInstantBreakoutBot:
         for s in added:
             self.states.setdefault(s, SymbolState(symbol=s))
 
-        if USE_VOL_SPIKE:
-            vol_txt = (
-                f"cur base>={VOL_SPIKE_MULT:g}x avg last {VOL_SPIKE_LOOKBACK}"
+        if STRATEGY == "grid":
+            log.info(
+                "Universe: %d spot USDT | +%d / -%d | GRID step=%.2f%% max_pos=%d",
+                len(self.symbols),
+                len(added),
+                len(removed),
+                GRID_STEP_PCT,
+                MAX_POSITIONS,
             )
-        elif MIN_CANDLE_BASE_VOL > 0:
-            vol_txt = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
         else:
-            vol_txt = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
-        log.info(
-            "Universe: %d spot USDT pairs | +%d / -%d | "
-            "entry: %s & up>=%.1f%%",
-            len(self.symbols),
-            len(added),
-            len(removed),
-            vol_txt,
-            MIN_CANDLE_PCT,
-        )
+            if USE_VOL_SPIKE:
+                vol_txt = (
+                    f"cur base>={VOL_SPIKE_MULT:g}x avg last {VOL_SPIKE_LOOKBACK}"
+                )
+            elif MIN_CANDLE_BASE_VOL > 0:
+                vol_txt = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
+            else:
+                vol_txt = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
+            log.info(
+                "Universe: %d spot USDT pairs | +%d / -%d | "
+                "entry: %s & up>=%.1f%%",
+                len(self.symbols),
+                len(added),
+                len(removed),
+                vol_txt,
+                MIN_CANDLE_PCT,
+            )
 
     async def _symbol_refresh_loop(self) -> None:
         while self._running:
@@ -307,15 +344,17 @@ class FBBInstantBreakoutBot:
                 log.debug("Warmup error %s: %s", sym, res)
 
     async def _fetch_and_apply_ohlcv(self, symbol: str) -> None:
+        need = GRID_OHLCV_LIMIT if STRATEGY == "grid" else OHLCV_LIMIT
+        min_bars = 2 if STRATEGY == "grid" else FBB_LENGTH + 1
         try:
             candles = await self.exchange.fetch_ohlcv(
-                symbol, TIMEFRAME, limit=OHLCV_LIMIT
+                symbol, TIMEFRAME, limit=need
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("OHLCV fetch failed %s: %s", symbol, exc)
             return
 
-        if not candles or len(candles) < FBB_LENGTH + 1:
+        if not candles or len(candles) < min_bars:
             return
 
         now_ms = int(self.exchange.milliseconds())
@@ -331,7 +370,8 @@ class FBBInstantBreakoutBot:
         prev_ts = state.candle_ts
 
         state.ohlcv = [list(map(float, c)) for c in closed]
-        self._recompute_indicators(state)
+        if STRATEGY != "grid":
+            self._recompute_indicators(state)
 
         if active is not None:
             new_ts = int(active[0])
@@ -353,9 +393,19 @@ class FBBInstantBreakoutBot:
                 state, ts=border, o=px, h=px, l=px, c=px, v=0.0, reset_flags=True
             )
 
-        state.ready = state.upper_0786 > 0
+        if STRATEGY == "grid":
+            if state.grid_anchor <= 0:
+                if state.close > 0:
+                    state.grid_anchor = state.close
+                elif state.ohlcv:
+                    state.grid_anchor = float(state.ohlcv[-1][4])
+            state.ready = state.grid_anchor > 0
+        else:
+            state.ready = state.upper_0786 > 0
 
     def _recompute_indicators(self, state: SymbolState) -> None:
+        if STRATEGY == "grid":
+            return
         fbb = fibonacci_bollinger(state.ohlcv, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:
             state.ready = False
@@ -396,7 +446,7 @@ class FBBInstantBreakoutBot:
         )
 
     def _update_entry_arm(self, state: SymbolState) -> None:
-        if not state.ready:
+        if STRATEGY == "grid" or not state.ready:
             return
         state.entry_armed = update_armed(
             state.entry_armed,
@@ -418,8 +468,9 @@ class FBBInstantBreakoutBot:
                     float(state.volume),
                 ]
             )
-            if len(state.ohlcv) > OHLCV_LIMIT:
-                state.ohlcv = state.ohlcv[-OHLCV_LIMIT:]
+            lim = GRID_OHLCV_LIMIT if STRATEGY == "grid" else OHLCV_LIMIT
+            if len(state.ohlcv) > lim:
+                state.ohlcv = state.ohlcv[-lim:]
             self._recompute_indicators(state)
 
         self._apply_active(
@@ -434,9 +485,10 @@ class FBBInstantBreakoutBot:
         )
 
     async def _ohlcv_refresh_loop(self) -> None:
-        """Slow FBB refresh for all coins. Volume fetched on-demand per candidate only."""
+        """Periodic OHLCV refresh (FBB bands, or grid anchor re-sync)."""
+        refresh = 180 if STRATEGY == "grid" else FBB_REFRESH_SEC
         while self._running:
-            await asyncio.sleep(FBB_REFRESH_SEC)
+            await asyncio.sleep(refresh)
             if not self.symbols:
                 continue
             chunk = 40
@@ -459,7 +511,7 @@ class FBBInstantBreakoutBot:
                 await self._fetch_and_apply_ohlcv(sym)
 
             # EMA runner: each 1m close; per-position TF decides if bucket closed
-            if USE_EMA_EXIT and self.positions:
+            if STRATEGY != "grid" and USE_EMA_EXIT and self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
 
@@ -527,6 +579,13 @@ class FBBInstantBreakoutBot:
             state.close = price
             self._update_entry_arm(state)
 
+        if STRATEGY == "grid":
+            if symbol in self.positions:
+                await self._check_grid_exits(symbol, price)
+            elif symbol not in self.held_symbols:
+                await self._maybe_grid_enter(state, price)
+            return
+
         if symbol in self.positions:
             await self._check_stops(symbol, price)
 
@@ -537,6 +596,78 @@ class FBBInstantBreakoutBot:
             return
 
         await self._maybe_enter(state)
+
+    async def _maybe_grid_enter(self, state: SymbolState, price: float) -> None:
+        if state.symbol in self.held_symbols or price <= 0:
+            return
+        if state.grid_anchor <= 0:
+            state.grid_anchor = price
+            return
+
+        ratcheted = grid_ratchet_anchor(price, state.grid_anchor)
+        if ratcheted != state.grid_anchor:
+            state.grid_anchor = ratcheted
+            return
+
+        if not grid_should_buy(price, state.grid_anchor):
+            return
+
+        async with self._trade_lock:
+            if state.symbol in self.held_symbols:
+                return
+            if len(self.positions) >= MAX_POSITIONS:
+                return
+            if not grid_should_buy(price, state.grid_anchor):
+                return
+            log.info(
+                "SIGNAL BUY GRID %s | price=%.6f <= anchor=%.6f -%.2f%% | open=%d/%d",
+                state.symbol,
+                price,
+                state.grid_anchor,
+                GRID_STEP_PCT,
+                len(self.positions),
+                MAX_POSITIONS,
+            )
+            candle_low = state.low if state.low != float("inf") else price
+            ok = await self._market_buy(
+                state.symbol, price, state.candle_ts, candle_low
+            )
+            if not ok:
+                log.warning("GRID buy failed %s", state.symbol)
+
+    async def _check_grid_exits(self, symbol: str, price: float) -> None:
+        pos = self.positions.get(symbol)
+        if pos is None or pos.entry_price <= 0 or pos.close_pending:
+            return
+
+        hit_tp, _ = grid_tp_hit(price, pos.entry_price)
+        hit_stop, _ = grid_stop_hit(price, pos.entry_price)
+        if not hit_tp and not hit_stop:
+            return
+
+        reason = (
+            f"grid TP +{GRID_STEP_PCT:g}%"
+            if hit_tp
+            else f"grid stop -{GRID_STEP_PCT * GRID_STOP_LEVELS:g}%"
+        )
+        pos.close_pending = True
+        async with self._trade_lock:
+            if symbol not in self.positions:
+                return
+            cur = self.positions[symbol]
+            pnl_pct = (price - cur.entry_price) / cur.entry_price * 100.0
+            log.info(
+                "SIGNAL SELL GRID %s | %s | price=%.6f entry=%.6f pnl=%.2f%%",
+                symbol,
+                reason,
+                price,
+                cur.entry_price,
+                pnl_pct,
+            )
+            await self._market_close(symbol, reason=reason)
+            state = self.states.get(symbol)
+            if state is not None and price > 0:
+                state.grid_anchor = price
 
     async def _maybe_enter(self, state: SymbolState) -> None:
         if state.symbol in self.held_symbols or state.broke_red:
