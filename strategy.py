@@ -103,7 +103,7 @@ def _parse_partial_ladder(raw: str) -> list[tuple[float, float]]:
 
 
 PARTIAL_LADDER = _parse_partial_ladder(
-    os.getenv("PARTIAL_LADDER", "1:0.30,2:0.30")
+    os.getenv("PARTIAL_LADDER", "0.5:0.30,2:0.30")
 )
 if not PARTIAL_LADDER and PARTIAL_TP_PCT > 0 and PARTIAL_TP_FRAC > 0:
     PARTIAL_LADDER = [(PARTIAL_TP_PCT, PARTIAL_TP_FRAC)]
