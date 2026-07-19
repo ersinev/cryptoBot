@@ -31,6 +31,7 @@ from strategy import (
     FBB_MULT,
     FEE_RATE,
     HARD_STOP_PCT,
+    MIN_CANDLE_BASE_VOL,
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     ORDER_USDT,
@@ -51,7 +52,7 @@ from strategy import (
     hard_stop_hit,
     ladder_label,
     next_ladder_partial,
-    prev_candle_quote_ok,
+    prev_candle_vol_ok,
     runner_ema_tf,
     tf_just_closed,
     trail_should_arm,
@@ -263,9 +264,13 @@ def run_backtest(
 
     if verbose:
         print(f"\nRunning backtest on {n} closed 1m candles...\n")
+        if MIN_CANDLE_BASE_VOL > 0:
+            vol_need = f"prev 1m base >= {MIN_CANDLE_BASE_VOL:.0f} (chart)"
+        else:
+            vol_need = f"prev 1m vol >= {MIN_CANDLE_QUOTE_VOL:.0f}"
         print(
             f"Entry: armed persist + FBB 0.786 wick break | "
-            f"prev 1m vol >= {MIN_CANDLE_QUOTE_VOL:.0f} | candle >= {MIN_CANDLE_PCT}%\n"
+            f"{vol_need} | candle >= {MIN_CANDLE_PCT}%\n"
         )
         partial_txt = (ladder_label() + " + ") if PARTIAL_LADDER else ""
         trail_txt = (
@@ -392,7 +397,7 @@ def run_backtest(
             cnt_fail_vol_abs += 1
             continue
         prev = closed[-1]
-        vol_pass, quote_vol = prev_candle_quote_ok(float(prev[5]), float(prev[4]))
+        vol_pass, vol_meas = prev_candle_vol_ok(float(prev[5]), float(prev[4]))
         if not vol_pass:
             skipped_vol += 1
             cnt_fail_vol_abs += 1
@@ -415,16 +420,20 @@ def run_backtest(
         ladder_done = [False] * len(PARTIAL_LADDER)
         realized_pnl = 0.0
         realized_fees = 0.0
-        entry_vol_ratio = quote_vol
+        entry_vol_ratio = vol_meas
         entry_candle_pct = candle_pct
         in_pos = True
         armed = False
         if verbose:
+            if MIN_CANDLE_BASE_VOL > 0:
+                vol_s = f"prev_1m_base={vol_meas/1e6:.2f}M"
+            else:
+                vol_s = f"prev_1m_vol={vol_meas/1e3:.0f}K"
             print(
                 f"BUY  #{len(trades)+1:03d} | {ms_to_str(ts)} | "
                 f"price={fill:.8f} | grey={upper_0236:.8f} | "
                 f"entry0786={upper_0786:.8f} | red={upper_1000:.8f} | "
-                f"prev_1m_vol={quote_vol/1e3:.0f}K | "
+                f"{vol_s} | "
                 f"up={candle_pct:.2f}% | low={l:.8f} open={o:.8f}"
             )
 
@@ -437,10 +446,16 @@ def run_backtest(
     if verbose:
         print("\nFilter funnel:")
         print(f"  FBB armed persist + 0.786 break : {cnt_armed_break}")
-        print(
-            f"  fail prev 1m quote vol: {cnt_fail_vol_abs}  "
-            f"(need >= {MIN_CANDLE_QUOTE_VOL:.0f})"
-        )
+        if MIN_CANDLE_BASE_VOL > 0:
+            print(
+                f"  fail prev 1m base vol: {cnt_fail_vol_abs}  "
+                f"(need >= {MIN_CANDLE_BASE_VOL:.0f} chart)"
+            )
+        else:
+            print(
+                f"  fail prev 1m quote vol: {cnt_fail_vol_abs}  "
+                f"(need >= {MIN_CANDLE_QUOTE_VOL:.0f})"
+            )
         print(f"  fail candle pct     : {cnt_fail_pct}  (need >= {MIN_CANDLE_PCT}%)")
         print(f"  passed all (entries): {cnt_pass}")
 
@@ -467,7 +482,10 @@ def print_symbol_summary(
     print(f"Candles    : {len(ohlcv)}")
     print(f"Trades     : {len(trades)}")
     print(f"Notional   : {ORDER_USDT} USDT / trade")
-    print(f"1m vol min : prev closed >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
+    if MIN_CANDLE_BASE_VOL > 0:
+        print(f"1m vol min : prev closed base >= {MIN_CANDLE_BASE_VOL:.0f} (chart)")
+    else:
+        print(f"1m vol min : prev closed >= {MIN_CANDLE_QUOTE_VOL:.0f} USDT (no rel)")
     print(f"Candle up  : >= {MIN_CANDLE_PCT}% (high-open)/open")
     print("Armed       : grey dip persists until FBB 0.786 break")
     if EMA_PROGRESSIVE:
@@ -713,9 +731,13 @@ async def main() -> None:
             if USE_TRAIL
             else " / no trail"
         )
+        if MIN_CANDLE_BASE_VOL > 0:
+            vol_bit = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
+        else:
+            vol_bit = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
         print(
             f"BACKTEST | spot | last {LOOKBACK_DAYS}d | 1m FBB 0.786 break | "
-            f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT | "
+            f"{vol_bit} | "
             f"candle>={MIN_CANDLE_PCT}% | "
             f"exit entry-candle-low / {partial_bit}"
             f"{'EMA'+str(EMA_PERIOD)+' prog' if EMA_PROGRESSIVE else 'EMA'+str(EMA_PERIOD)+' '+EMA_EXIT_TF}"

@@ -4,7 +4,7 @@ Fibonacci Bollinger Instant Breakout — Binance Spot
 Entry (1m, instant on FBB 0.786 break — one band below red):
   1) Grey dip arms (persists across candles until entry)
   2) Price breaks FBB upper 0.786 (wick/high)
-  3) Previous closed 1m quote vol >= MIN_CANDLE_QUOTE_VOL (no rel filter)
+  3) Previous closed 1m chart BASE vol >= MIN_CANDLE_BASE_VOL (default 8M)
   4) Candle upside >= MIN_CANDLE_PCT → market buy (quote USDT)
 
 Exit (env-driven; default plan: hard -1.5 / 70%@+3 / BE+0.3 / trail +5/-2):
@@ -41,6 +41,7 @@ from strategy import (
     FBB_LENGTH,
     FBB_MULT,
     HARD_STOP_PCT,
+    MIN_CANDLE_BASE_VOL,
     MIN_CANDLE_PCT,
     MIN_CANDLE_QUOTE_VOL,
     OHLCV_LIMIT,
@@ -67,7 +68,7 @@ from strategy import (
     tf_just_closed,
     trail_should_arm,
     trail_stop_hit,
-    prev_candle_quote_ok,
+    prev_candle_vol_ok,
     price_entry_ready,
     update_armed,
 )
@@ -254,13 +255,17 @@ class FBBInstantBreakoutBot:
         for s in added:
             self.states.setdefault(s, SymbolState(symbol=s))
 
+        if MIN_CANDLE_BASE_VOL > 0:
+            vol_txt = f"prev 1m base>={MIN_CANDLE_BASE_VOL:.0f} (chart)"
+        else:
+            vol_txt = f"prev 1m vol>={MIN_CANDLE_QUOTE_VOL:.0f} USDT"
         log.info(
             "Universe: %d spot USDT pairs | +%d / -%d | "
-            "entry: prev 1m vol>=%.0f USDT & up>=%.1f%%",
+            "entry: %s & up>=%.1f%%",
             len(self.symbols),
             len(added),
             len(removed),
-            MIN_CANDLE_QUOTE_VOL,
+            vol_txt,
             MIN_CANDLE_PCT,
         )
 
@@ -536,14 +541,22 @@ class FBBInstantBreakoutBot:
         if not state.ohlcv:
             return
         prev = state.ohlcv[-1]
-        vol_ok, quote_vol = prev_candle_quote_ok(float(prev[5]), float(prev[4]))
+        vol_ok, vol_meas = prev_candle_vol_ok(float(prev[5]), float(prev[4]))
         if not vol_ok:
-            log.debug(
-                "WAIT PREV VOL %s | prev 1m quote %.0f (min %.0f)",
-                state.symbol,
-                quote_vol,
-                MIN_CANDLE_QUOTE_VOL,
-            )
+            if MIN_CANDLE_BASE_VOL > 0:
+                log.debug(
+                    "WAIT PREV VOL %s | prev 1m base %.0f (min %.0f chart)",
+                    state.symbol,
+                    vol_meas,
+                    MIN_CANDLE_BASE_VOL,
+                )
+            else:
+                log.debug(
+                    "WAIT PREV VOL %s | prev 1m quote %.0f (min %.0f)",
+                    state.symbol,
+                    vol_meas,
+                    MIN_CANDLE_QUOTE_VOL,
+                )
             return
 
         async with self._trade_lock:
@@ -557,15 +570,19 @@ class FBBInstantBreakoutBot:
             ):
                 return
             state.broke_red = True
+            if MIN_CANDLE_BASE_VOL > 0:
+                vol_log = f"prev_1m_base={vol_meas:.0f} (chart)"
+            else:
+                vol_log = f"prev_1m_vol={vol_meas:.0f} USDT"
             log.info(
                 "SIGNAL BUY %s | high=%.6f > entry0786=%.6f | red=%.6f | grey=%.6f | "
-                "prev_1m_vol=%.0f USDT | up=%.2f%% | low=%.6f open=%.6f",
+                "%s | up=%.2f%% | low=%.6f open=%.6f",
                 state.symbol,
                 state.high,
                 state.upper_0786,
                 state.upper_1000,
                 state.upper_0236,
-                quote_vol,
+                vol_log,
                 candle_pct,
                 state.low,
                 state.open,

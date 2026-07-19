@@ -22,6 +22,10 @@ EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
+# Chart-style 1m BASE volume (Binance candle volume units), prev closed bar.
+# Default 8M — matches chart "Volume" for cheap alts (not USDT quote).
+MIN_CANDLE_BASE_VOL = float(os.getenv("MIN_CANDLE_BASE_VOL", "8000000"))
+# Legacy USDT quote floor (used only when MIN_CANDLE_BASE_VOL <= 0)
 MIN_CANDLE_QUOTE_VOL = float(os.getenv("MIN_CANDLE_QUOTE_VOL", "10000"))
 VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))
 ENTRY_VOL_LIMIT = VOL_LOOKBACK + 2
@@ -240,6 +244,23 @@ def prev_candle_quote_ok(base_vol: float, close_price: float) -> tuple[bool, flo
     """Previous closed 1m quote vol only (>= MIN_CANDLE_QUOTE_VOL). No rel filter."""
     quote_vol = base_vol * max(close_price, 0.0)
     return quote_vol >= MIN_CANDLE_QUOTE_VOL, quote_vol
+
+
+def prev_candle_base_ok(base_vol: float) -> tuple[bool, float]:
+    """Previous closed 1m BASE vol (chart Volume) >= MIN_CANDLE_BASE_VOL."""
+    return base_vol >= MIN_CANDLE_BASE_VOL, base_vol
+
+
+def prev_candle_vol_ok(base_vol: float, close_price: float) -> tuple[bool, float]:
+    """
+    Entry volume gate on previous closed 1m candle.
+    Prefer chart-style BASE (>= MIN_CANDLE_BASE_VOL) when that env is > 0;
+    otherwise fall back to USDT quote (>= MIN_CANDLE_QUOTE_VOL).
+    Returns (ok, measured_vol) where measured_vol is base or quote accordingly.
+    """
+    if MIN_CANDLE_BASE_VOL > 0:
+        return prev_candle_base_ok(base_vol)
+    return prev_candle_quote_ok(base_vol, close_price)
 
 
 def entry_rules_met(armed: bool, high: float, open_: float, entry_line: float) -> bool:
