@@ -21,15 +21,22 @@ FBB_MULT = 3.0
 EMA_PERIOD = 9
 FEE_RATE = 0.001  # spot taker ~0.1%
 
-# "grid" | "fbb" — grid is the live experiment default
-STRATEGY = os.getenv("STRATEGY", "grid").strip().lower()
-if STRATEGY not in ("grid", "fbb"):
-    STRATEGY = "grid"
+# "fade" | "grid" | "fbb" — fade won realistic max_pos backtests
+STRATEGY = os.getenv("STRATEGY", "fade").strip().lower()
+if STRATEGY not in ("fade", "grid", "fbb"):
+    STRATEGY = "fade"
 
 # Grid %1: buy -step from anchor, TP +step, hard stop -(step*levels)
 GRID_STEP_PCT = float(os.getenv("GRID_STEP_PCT", "1.0"))
 GRID_STOP_LEVELS = float(os.getenv("GRID_STOP_LEVELS", "3"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
+
+# Fade pump: 5m pump candle >= FADE_PUMP_PCT → wait red 5m close → buy
+# Exit: +FADE_TP_PCT / -FADE_SL_PCT
+FADE_PUMP_PCT = float(os.getenv("FADE_PUMP_PCT", "3.5"))
+FADE_TP_PCT = float(os.getenv("FADE_TP_PCT", "1.2"))
+FADE_SL_PCT = float(os.getenv("FADE_SL_PCT", "1.5"))
+FADE_TF_MS = 5 * 60_000
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
 # Optional absolute chart BASE floor (0 = off).
@@ -128,6 +135,7 @@ def ladder_label() -> str:
 OHLCV_LIMIT = FBB_LENGTH + 30
 OHLCV_5M_LIMIT = EMA_PERIOD + 30
 GRID_OHLCV_LIMIT = 50
+FADE_OHLCV_LIMIT = 120  # ~2h of 1m for 5m aggregate
 
 
 def grid_should_buy(price: float, anchor: float, step_pct: float = GRID_STEP_PCT) -> bool:
@@ -166,6 +174,42 @@ def grid_stop_hit(
         return False, 0.0
     stop = entry * (1.0 - step_pct / 100.0 * levels)
     if price <= stop:
+        return True, price
+    return False, 0.0
+
+
+def fade_pump_pct(open_px: float, high_px: float) -> float:
+    if open_px <= 0:
+        return 0.0
+    return (high_px - open_px) / open_px * 100.0
+
+
+def fade_should_arm(
+    open_px: float, high_px: float, pump_pct: float = FADE_PUMP_PCT
+) -> bool:
+    return fade_pump_pct(open_px, high_px) >= pump_pct
+
+
+def fade_is_red_close(open_px: float, close_px: float) -> bool:
+    return close_px < open_px
+
+
+def fade_tp_hit(
+    price: float, entry: float, tp_pct: float = FADE_TP_PCT
+) -> tuple[bool, float]:
+    if entry <= 0 or price <= 0:
+        return False, 0.0
+    if price >= entry * (1.0 + tp_pct / 100.0):
+        return True, price
+    return False, 0.0
+
+
+def fade_sl_hit(
+    price: float, entry: float, sl_pct: float = FADE_SL_PCT
+) -> tuple[bool, float]:
+    if entry <= 0 or price <= 0:
+        return False, 0.0
+    if price <= entry * (1.0 - sl_pct / 100.0):
         return True, price
     return False, 0.0
 

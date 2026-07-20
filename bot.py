@@ -1,13 +1,13 @@
 """
-Binance Spot DEMO bot — STRATEGY=grid (default) or STRATEGY=fbb.
+Binance Spot DEMO bot — STRATEGY=fade (default) | grid | fbb.
 
-Grid (default experiment):
-  Anchor starts at last close. Flat: buy if price <= anchor - GRID_STEP_PCT%;
-  if price >= anchor + step, ratchet anchor up (no chase).
-  Long: sell +step TP, or -(step*GRID_STOP_LEVELS) hard stop.
-  Max MAX_POSITIONS concurrent.
+Fade (default):
+  On each closed 5m bar: if prior 5m pumped >= FADE_PUMP_PCT, arm;
+  if armed and this 5m closed red → market buy.
+  Exit: +FADE_TP_PCT / -FADE_SL_PCT. Max MAX_POSITIONS.
 
-FBB mode: classic Fibonacci Bollinger instant breakout + ladder/trail exits.
+Grid: anchor -step buy / +step TP / -(step*levels) stop.
+FBB: classic Fibonacci Bollinger instant breakout + ladder/trail.
 """
 from __future__ import annotations
 
@@ -34,6 +34,11 @@ from strategy import (
     EMA_PERIOD,
     EMA_PROG_MODE,
     EMA_PROGRESSIVE,
+    FADE_OHLCV_LIMIT,
+    FADE_PUMP_PCT,
+    FADE_SL_PCT,
+    FADE_TF_MS,
+    FADE_TP_PCT,
     FBB_LENGTH,
     FBB_MULT,
     GRID_OHLCV_LIMIT,
@@ -59,12 +64,18 @@ from strategy import (
     USE_VOL_SPIKE,
     VOL_SPIKE_LOOKBACK,
     VOL_SPIKE_MULT,
+    aggregate_ohlcv,
     breakeven_stop_hit,
     candle_up_pct,
     ema_exit_signal,
     entry_candle_stop_hit,
     entry_rules_met,
     entry_vol_ok,
+    fade_is_red_close,
+    fade_pump_pct,
+    fade_should_arm,
+    fade_sl_hit,
+    fade_tp_hit,
     grid_ratchet_anchor,
     grid_should_buy,
     grid_stop_hit,
@@ -118,6 +129,8 @@ class SymbolState:
     broke_red: bool = False  # one entry attempt per 1m candle (backtest parity)
     vol_fetch_ms: int = 0  # throttle on-demand OHLCV for vol spike
     grid_anchor: float = 0.0  # grid reference price
+    fade_armed: bool = False  # saw pump 5m; wait for red 5m close
+    last_fade_5m_ts: int = 0  # last 5m close we evaluated
 
 
 @dataclass
@@ -194,7 +207,18 @@ class FBBInstantBreakoutBot:
         await self.exchange.load_markets()
         await self.refresh_symbols()
         await self.warmup_all()
-        if STRATEGY == "grid":
+        if STRATEGY == "fade":
+            log.info(
+                "Config: FADE | %s USDT/trade | 5m pump>=%.1f%% then red close | "
+                "TP +%.1f%% / SL -%.1f%% | max_pos=%d | telegram=%s",
+                ORDER_USDT,
+                FADE_PUMP_PCT,
+                FADE_TP_PCT,
+                FADE_SL_PCT,
+                MAX_POSITIONS,
+                "ON" if telegram_enabled() else "OFF",
+            )
+        elif STRATEGY == "grid":
             log.info(
                 "Config: GRID | %s USDT/trade | step=%.2f%% | stop=-%.2f%% "
                 "(%g levels) | max_pos=%d | telegram=%s",
@@ -247,7 +271,14 @@ class FBBInstantBreakoutBot:
             asyncio.create_task(self._candle_boundary_loop(), name="candles"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
         ]
-        if STRATEGY == "grid":
+        if STRATEGY == "fade":
+            log.info(
+                "Live scan ON | %d coins | FADE pump>=%.1f%% -> red 5m | max %d pos",
+                len(self.symbols),
+                FADE_PUMP_PCT,
+                MAX_POSITIONS,
+            )
+        elif STRATEGY == "grid":
             log.info(
                 "Live scan ON | %d coins | GRID -%.2f%% buy / +%.2f%% sell | max %d pos",
                 len(self.symbols),
@@ -286,7 +317,16 @@ class FBBInstantBreakoutBot:
         for s in added:
             self.states.setdefault(s, SymbolState(symbol=s))
 
-        if STRATEGY == "grid":
+        if STRATEGY == "fade":
+            log.info(
+                "Universe: %d spot USDT | +%d / -%d | FADE pump>=%.1f%% max_pos=%d",
+                len(self.symbols),
+                len(added),
+                len(removed),
+                FADE_PUMP_PCT,
+                MAX_POSITIONS,
+            )
+        elif STRATEGY == "grid":
             log.info(
                 "Universe: %d spot USDT | +%d / -%d | GRID step=%.2f%% max_pos=%d",
                 len(self.symbols),
@@ -343,9 +383,19 @@ class FBBInstantBreakoutBot:
             if isinstance(res, Exception):
                 log.debug("Warmup error %s: %s", sym, res)
 
+    def _light_mode(self) -> bool:
+        return STRATEGY in ("grid", "fade")
+
+    def _ohlcv_limit(self) -> int:
+        if STRATEGY == "fade":
+            return FADE_OHLCV_LIMIT
+        if STRATEGY == "grid":
+            return GRID_OHLCV_LIMIT
+        return OHLCV_LIMIT
+
     async def _fetch_and_apply_ohlcv(self, symbol: str) -> None:
-        need = GRID_OHLCV_LIMIT if STRATEGY == "grid" else OHLCV_LIMIT
-        min_bars = 2 if STRATEGY == "grid" else FBB_LENGTH + 1
+        need = self._ohlcv_limit()
+        min_bars = 2 if self._light_mode() else FBB_LENGTH + 1
         try:
             candles = await self.exchange.fetch_ohlcv(
                 symbol, TIMEFRAME, limit=need
@@ -370,7 +420,7 @@ class FBBInstantBreakoutBot:
         prev_ts = state.candle_ts
 
         state.ohlcv = [list(map(float, c)) for c in closed]
-        if STRATEGY != "grid":
+        if STRATEGY == "fbb":
             self._recompute_indicators(state)
 
         if active is not None:
@@ -400,11 +450,13 @@ class FBBInstantBreakoutBot:
                 elif state.ohlcv:
                     state.grid_anchor = float(state.ohlcv[-1][4])
             state.ready = state.grid_anchor > 0
+        elif STRATEGY == "fade":
+            state.ready = len(state.ohlcv) >= 10 or state.close > 0
         else:
             state.ready = state.upper_0786 > 0
 
     def _recompute_indicators(self, state: SymbolState) -> None:
-        if STRATEGY == "grid":
+        if STRATEGY != "fbb":
             return
         fbb = fibonacci_bollinger(state.ohlcv, length=FBB_LENGTH, mult=FBB_MULT)
         if fbb is None:
@@ -446,7 +498,7 @@ class FBBInstantBreakoutBot:
         )
 
     def _update_entry_arm(self, state: SymbolState) -> None:
-        if STRATEGY == "grid" or not state.ready:
+        if STRATEGY != "fbb" or not state.ready:
             return
         state.entry_armed = update_armed(
             state.entry_armed,
@@ -468,7 +520,7 @@ class FBBInstantBreakoutBot:
                     float(state.volume),
                 ]
             )
-            lim = GRID_OHLCV_LIMIT if STRATEGY == "grid" else OHLCV_LIMIT
+            lim = self._ohlcv_limit()
             if len(state.ohlcv) > lim:
                 state.ohlcv = state.ohlcv[-lim:]
             self._recompute_indicators(state)
@@ -485,8 +537,8 @@ class FBBInstantBreakoutBot:
         )
 
     async def _ohlcv_refresh_loop(self) -> None:
-        """Periodic OHLCV refresh (FBB bands, or grid anchor re-sync)."""
-        refresh = 180 if STRATEGY == "grid" else FBB_REFRESH_SEC
+        """Periodic OHLCV refresh (FBB bands, or light-mode sync)."""
+        refresh = 180 if self._light_mode() else FBB_REFRESH_SEC
         while self._running:
             await asyncio.sleep(refresh)
             if not self.symbols:
@@ -511,7 +563,7 @@ class FBBInstantBreakoutBot:
                 await self._fetch_and_apply_ohlcv(sym)
 
             # EMA runner: each 1m close; per-position TF decides if bucket closed
-            if STRATEGY != "grid" and USE_EMA_EXIT and self.positions:
+            if STRATEGY == "fbb" and USE_EMA_EXIT and self.positions:
                 for sym in list(self.positions.keys()):
                     await self._maybe_ema_exit(sym)
 
@@ -522,6 +574,9 @@ class FBBInstantBreakoutBot:
                 if state.candle_ts < border_ts:
                     closed_close = state.close or state.open
                     self._roll_local_candle(state, border_ts, closed_close)
+
+            if STRATEGY == "fade" and border_ts % FADE_TF_MS == 0:
+                await self._fade_on_5m_close(border_ts)
 
     # ------------------------------------------------------------------
     # Tickers → stops + entry
@@ -586,6 +641,11 @@ class FBBInstantBreakoutBot:
                 await self._maybe_grid_enter(state, price)
             return
 
+        if STRATEGY == "fade":
+            if symbol in self.positions:
+                await self._check_fade_exits(symbol, price)
+            return
+
         if symbol in self.positions:
             await self._check_stops(symbol, price)
 
@@ -596,6 +656,107 @@ class FBBInstantBreakoutBot:
             return
 
         await self._maybe_enter(state)
+
+    async def _fade_on_5m_close(self, border_1m_ts: int) -> None:
+        """After a 5m boundary: arm on prior pump bar, buy on red close."""
+        for sym in list(self.symbols):
+            state = self.states.get(sym)
+            if not state or not state.ready:
+                continue
+            if state.last_fade_5m_ts >= border_1m_ts:
+                continue
+            state.last_fade_5m_ts = border_1m_ts
+
+            if sym in self.held_symbols or sym in self.positions:
+                continue
+
+            series = ohlcv_with_active(
+                state.ohlcv,
+                state.candle_ts,
+                state.open,
+                state.high,
+                state.low,
+                state.close,
+                state.volume,
+            )
+            bars_5m = aggregate_ohlcv(series, FADE_TF_MS)
+            closed = [
+                b for b in bars_5m if int(b[0]) + FADE_TF_MS <= border_1m_ts
+            ]
+            if len(closed) < 2:
+                continue
+
+            prev, cur = closed[-2], closed[-1]
+            po, ph = float(prev[1]), float(prev[2])
+            co, cc = float(cur[1]), float(cur[4])
+
+            if fade_should_arm(po, ph):
+                state.fade_armed = True
+                log.info(
+                    "FADE ARM %s | prev5m pump=%.2f%% (need %.1f%%)",
+                    sym,
+                    fade_pump_pct(po, ph),
+                    FADE_PUMP_PCT,
+                )
+
+            if not state.fade_armed or not fade_is_red_close(co, cc):
+                continue
+
+            async with self._trade_lock:
+                if sym in self.held_symbols or sym in self.positions:
+                    continue
+                if len(self.positions) >= MAX_POSITIONS:
+                    continue
+                if not state.fade_armed:
+                    continue
+                log.info(
+                    "SIGNAL BUY FADE %s | red 5m close=%.6f after pump | open=%d/%d",
+                    sym,
+                    cc,
+                    len(self.positions),
+                    MAX_POSITIONS,
+                )
+                ok = await self._market_buy(
+                    sym, cc, int(cur[0]), float(cur[3])
+                )
+                if ok:
+                    state.fade_armed = False
+                else:
+                    log.warning("FADE buy failed %s", sym)
+
+    async def _check_fade_exits(self, symbol: str, price: float) -> None:
+        pos = self.positions.get(symbol)
+        if pos is None or pos.entry_price <= 0 or pos.close_pending:
+            return
+
+        hit_tp, _ = fade_tp_hit(price, pos.entry_price)
+        hit_sl, _ = fade_sl_hit(price, pos.entry_price)
+        if not hit_tp and not hit_sl:
+            return
+
+        reason = (
+            f"fade TP +{FADE_TP_PCT:g}%"
+            if hit_tp
+            else f"fade SL -{FADE_SL_PCT:g}%"
+        )
+        pos.close_pending = True
+        async with self._trade_lock:
+            if symbol not in self.positions:
+                return
+            cur = self.positions[symbol]
+            pnl_pct = (price - cur.entry_price) / cur.entry_price * 100.0
+            log.info(
+                "SIGNAL SELL FADE %s | %s | price=%.6f entry=%.6f pnl=%.2f%%",
+                symbol,
+                reason,
+                price,
+                cur.entry_price,
+                pnl_pct,
+            )
+            await self._market_close(symbol, reason=reason)
+            state = self.states.get(symbol)
+            if state is not None:
+                state.fade_armed = False
 
     async def _maybe_grid_enter(self, state: SymbolState, price: float) -> None:
         if state.symbol in self.held_symbols or price <= 0:
@@ -981,6 +1142,7 @@ class FBBInstantBreakoutBot:
         state = self.states.get(symbol)
         if state is not None:
             state.entry_armed = False
+            state.fade_armed = False
             if not keep_broke_red:
                 state.broke_red = False
         log.info(
