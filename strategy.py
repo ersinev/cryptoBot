@@ -32,10 +32,11 @@ GRID_STOP_LEVELS = float(os.getenv("GRID_STOP_LEVELS", "3"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
 
 # Fade pump: 5m pump candle >= FADE_PUMP_PCT → wait red 5m close → buy
-# Exit: +FADE_TP_PCT / -FADE_SL_PCT
+# Exit: +FADE_TP_PCT / -FADE_SL_PCT  ( asymmetric R:R beat 1.2/1.5 in BT )
 FADE_PUMP_PCT = float(os.getenv("FADE_PUMP_PCT", "3.5"))
-FADE_TP_PCT = float(os.getenv("FADE_TP_PCT", "1.2"))
-FADE_SL_PCT = float(os.getenv("FADE_SL_PCT", "1.5"))
+FADE_TP_PCT = float(os.getenv("FADE_TP_PCT", "2.0"))
+FADE_SL_PCT = float(os.getenv("FADE_SL_PCT", "1.2"))
+FADE_MIN_PRICE = float(os.getenv("FADE_MIN_PRICE", "0.000001"))  # skip dust like BTTC
 FADE_TF_MS = 5 * 60_000
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))

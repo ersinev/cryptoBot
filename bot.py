@@ -34,6 +34,7 @@ from strategy import (
     EMA_PERIOD,
     EMA_PROG_MODE,
     EMA_PROGRESSIVE,
+    FADE_MIN_PRICE,
     FADE_OHLCV_LIMIT,
     FADE_PUMP_PCT,
     FADE_SL_PCT,
@@ -207,14 +208,16 @@ class FBBInstantBreakoutBot:
         await self.exchange.load_markets()
         await self.refresh_symbols()
         await self.warmup_all()
+        await self._sync_open_positions()
         if STRATEGY == "fade":
             log.info(
                 "Config: FADE | %s USDT/trade | 5m pump>=%.1f%% then red close | "
-                "TP +%.1f%% / SL -%.1f%% | max_pos=%d | telegram=%s",
+                "TP +%.1f%% / SL -%.1f%% | min_px=%g | max_pos=%d | telegram=%s",
                 ORDER_USDT,
                 FADE_PUMP_PCT,
                 FADE_TP_PCT,
                 FADE_SL_PCT,
+                FADE_MIN_PRICE,
                 MAX_POSITIONS,
                 "ON" if telegram_enabled() else "OFF",
             )
@@ -370,6 +373,79 @@ class FBBInstantBreakoutBot:
         await self._warmup_symbols(self.symbols)
         ready = sum(1 for s in self.symbols if self.states[s].ready)
         log.info("Warmup done: %d / %d ready", ready, len(self.symbols))
+
+    async def _sync_open_positions(self) -> None:
+        """Recover bags after restart so we don't stack buys / ignore max_pos."""
+        try:
+            bal = await self.exchange.fetch_balance()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Balance sync failed: %s", exc)
+            return
+
+        free = bal.get("free") or {}
+        recovered = 0
+        skip_quote = {"USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI"}
+        for base, raw_amt in free.items():
+            if base in skip_quote:
+                continue
+            try:
+                amt = float(raw_amt or 0)
+            except (TypeError, ValueError):
+                continue
+            if amt <= 0:
+                continue
+            symbol = f"{base}/USDT"
+            if symbol not in self.exchange.markets:
+                continue
+            if symbol in self.positions:
+                continue
+            try:
+                ticker = await self.exchange.fetch_ticker(symbol)
+                last = float(ticker.get("last") or 0)
+            except Exception:
+                continue
+            if last <= 0 or amt * last < 5.0:
+                continue  # dust
+            entry = last
+            try:
+                trades = await self.exchange.fetch_my_trades(symbol, limit=30)
+                for t in reversed(trades or []):
+                    if (t.get("side") or "").lower() == "buy":
+                        entry = float(t.get("price") or entry)
+                        break
+            except Exception:
+                pass
+            filled = float(self.exchange.amount_to_precision(symbol, amt))
+            if filled <= 0:
+                continue
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                amount=filled,
+                entry_price=entry,
+                entry_time=time.time(),
+                entry_candle_low=entry,
+                high_since_entry=max(entry, last),
+                trail_armed=False,
+                entry_candle_ts=0,
+                initial_amount=filled,
+                ladder_done=[],
+            )
+            self.held_symbols.add(symbol)
+            recovered += 1
+            log.info(
+                "RECOVER POS %s | qty=%s entry~%.6f last=%.6f ~%.1f USDT",
+                symbol,
+                filled,
+                entry,
+                last,
+                filled * last,
+            )
+        log.info(
+            "Position sync done | recovered=%d | open=%d / max=%d",
+            recovered,
+            len(self.positions),
+            MAX_POSITIONS,
+        )
 
     async def _warmup_symbols(self, symbols: list[str]) -> None:
         async def one(sym: str) -> None:
@@ -575,6 +651,17 @@ class FBBInstantBreakoutBot:
                     closed_close = state.close or state.open
                     self._roll_local_candle(state, border_ts, closed_close)
 
+            if STRATEGY == "fade" and self.positions:
+                for sym in list(self.positions.keys()):
+                    st = self.states.get(sym)
+                    if st is None:
+                        continue
+                    lo = st.low if st.low != float("inf") else st.close
+                    hi = st.high if st.high > 0 else st.close
+                    await self._check_fade_exits(
+                        sym, st.close or hi, bar_low=lo, bar_high=hi
+                    )
+
             if STRATEGY == "fade" and border_ts % FADE_TF_MS == 0:
                 await self._fade_on_5m_close(border_ts)
 
@@ -701,6 +788,10 @@ class FBBInstantBreakoutBot:
 
             if not state.fade_armed or not fade_is_red_close(co, cc):
                 continue
+            if FADE_MIN_PRICE > 0 and cc < FADE_MIN_PRICE:
+                state.fade_armed = False
+                log.info("FADE SKIP %s | price %.8f < min %g", sym, cc, FADE_MIN_PRICE)
+                continue
 
             async with self._trade_lock:
                 if sym in self.held_symbols or sym in self.positions:
@@ -724,21 +815,41 @@ class FBBInstantBreakoutBot:
                 else:
                     log.warning("FADE buy failed %s", sym)
 
-    async def _check_fade_exits(self, symbol: str, price: float) -> None:
+    async def _check_fade_exits(
+        self,
+        symbol: str,
+        price: float,
+        *,
+        bar_low: float | None = None,
+        bar_high: float | None = None,
+    ) -> None:
         pos = self.positions.get(symbol)
         if pos is None or pos.entry_price <= 0 or pos.close_pending:
             return
 
-        hit_tp, _ = fade_tp_hit(price, pos.entry_price)
-        hit_sl, _ = fade_sl_hit(price, pos.entry_price)
+        lo = bar_low if bar_low is not None and bar_low > 0 else price
+        hi = bar_high if bar_high is not None and bar_high > 0 else price
+
+        hit_sl, _ = fade_sl_hit(lo, pos.entry_price)
+        hit_tp, _ = fade_tp_hit(hi, pos.entry_price)
+        if not hit_tp and not hit_sl:
+            # also check last price
+            hit_tp, _ = fade_tp_hit(price, pos.entry_price)
+            hit_sl, _ = fade_sl_hit(price, pos.entry_price)
         if not hit_tp and not hit_sl:
             return
 
         reason = (
             f"fade TP +{FADE_TP_PCT:g}%"
-            if hit_tp
+            if hit_tp and not hit_sl
             else f"fade SL -{FADE_SL_PCT:g}%"
         )
+        # if both touched in same bar, SL first (safer)
+        if hit_sl:
+            reason = f"fade SL -{FADE_SL_PCT:g}%"
+        elif hit_tp:
+            reason = f"fade TP +{FADE_TP_PCT:g}%"
+
         pos.close_pending = True
         async with self._trade_lock:
             if symbol not in self.positions:
