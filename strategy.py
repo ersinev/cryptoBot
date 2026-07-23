@@ -32,11 +32,18 @@ GRID_STOP_LEVELS = float(os.getenv("GRID_STOP_LEVELS", "3"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
 
 # Fade pump: 5m pump candle >= FADE_PUMP_PCT → wait red 5m close → buy
-# Exit: +FADE_TP_PCT / -FADE_SL_PCT  ( asymmetric R:R beat 1.2/1.5 in BT )
+# Exit: +FADE_TP_PCT / -FADE_SL_PCT ; optional BE after +FADE_BE_ARM_PCT
+# Improved defaults (30d max10 BT): TP3/SL1.5 + retrace/erase filters ~2.5x base
 FADE_PUMP_PCT = float(os.getenv("FADE_PUMP_PCT", "3.5"))
-FADE_TP_PCT = float(os.getenv("FADE_TP_PCT", "2.0"))
-FADE_SL_PCT = float(os.getenv("FADE_SL_PCT", "1.2"))
+FADE_TP_PCT = float(os.getenv("FADE_TP_PCT", "3.0"))
+FADE_SL_PCT = float(os.getenv("FADE_SL_PCT", "1.5"))
 FADE_MIN_PRICE = float(os.getenv("FADE_MIN_PRICE", "0.000001"))  # skip dust like BTTC
+# Entry quality: pullback from pump high, but don't buy full dump past pump open
+FADE_MIN_RETRACE_PCT = float(os.getenv("FADE_MIN_RETRACE_PCT", "2.0"))
+FADE_MAX_ERASE_PCT = float(os.getenv("FADE_MAX_ERASE_PCT", "2.0"))
+# After +FADE_BE_ARM_PCT MFE, raise stop to entry*(1+FADE_BE_LOCK_PCT/100); 0 arm = off
+FADE_BE_ARM_PCT = float(os.getenv("FADE_BE_ARM_PCT", "1.0"))
+FADE_BE_LOCK_PCT = float(os.getenv("FADE_BE_LOCK_PCT", "0.0"))
 FADE_TF_MS = 5 * 60_000
 
 ORDER_USDT = float(os.getenv("ORDER_USDT", "100"))
@@ -195,24 +202,87 @@ def fade_is_red_close(open_px: float, close_px: float) -> bool:
     return close_px < open_px
 
 
+def fade_entry_ok(
+    close_px: float,
+    pump_open: float,
+    pump_high: float,
+    *,
+    min_price: float = FADE_MIN_PRICE,
+    min_retrace_pct: float = FADE_MIN_RETRACE_PCT,
+    max_erase_pct: float = FADE_MAX_ERASE_PCT,
+) -> tuple[bool, str]:
+    """
+    Entry quality after red close.
+    Returns (ok, skip_reason). Empty reason when ok.
+    """
+    if close_px <= 0:
+        return False, "bad close"
+    if min_price > 0 and close_px < min_price:
+        return False, f"price {close_px:.8f} < min {min_price:g}"
+    if max_erase_pct > 0 and pump_open > 0:
+        erase = (pump_open - close_px) / pump_open * 100.0
+        if erase > max_erase_pct:
+            return False, f"erase {erase:.2f}% > max {max_erase_pct:g}%"
+    if min_retrace_pct > 0 and pump_high > 0:
+        retr = (pump_high - close_px) / pump_high * 100.0
+        if retr < min_retrace_pct:
+            return False, f"retrace {retr:.2f}% < min {min_retrace_pct:g}%"
+    return True, ""
+
+
 def fade_tp_hit(
     price: float, entry: float, tp_pct: float = FADE_TP_PCT
 ) -> tuple[bool, float]:
-    if entry <= 0 or price <= 0:
+    if entry <= 0 or price <= 0 or tp_pct <= 0:
         return False, 0.0
     if price >= entry * (1.0 + tp_pct / 100.0):
         return True, price
     return False, 0.0
 
 
+def fade_stop_price(
+    entry: float,
+    *,
+    sl_pct: float = FADE_SL_PCT,
+    be_armed: bool = False,
+    be_lock_pct: float = FADE_BE_LOCK_PCT,
+) -> float:
+    """Hard SL, optionally raised to breakeven lock after BE arm."""
+    if entry <= 0:
+        return 0.0
+    hard = entry * (1.0 - sl_pct / 100.0)
+    if not be_armed:
+        return hard
+    lock = entry * (1.0 + be_lock_pct / 100.0)
+    return max(hard, lock)
+
+
 def fade_sl_hit(
-    price: float, entry: float, sl_pct: float = FADE_SL_PCT
+    price: float,
+    entry: float,
+    sl_pct: float = FADE_SL_PCT,
+    *,
+    be_armed: bool = False,
+    be_lock_pct: float = FADE_BE_LOCK_PCT,
 ) -> tuple[bool, float]:
     if entry <= 0 or price <= 0:
         return False, 0.0
-    if price <= entry * (1.0 - sl_pct / 100.0):
+    stop = fade_stop_price(
+        entry, sl_pct=sl_pct, be_armed=be_armed, be_lock_pct=be_lock_pct
+    )
+    if price <= stop:
         return True, price
     return False, 0.0
+
+
+def fade_be_should_arm(
+    entry: float,
+    high_water: float,
+    be_arm_pct: float = FADE_BE_ARM_PCT,
+) -> bool:
+    if be_arm_pct <= 0 or entry <= 0 or high_water <= 0:
+        return False
+    return high_water >= entry * (1.0 + be_arm_pct / 100.0)
 
 
 def aggregate_ohlcv(ohlcv: list[list[float]], bucket_ms: int) -> list[list[float]]:

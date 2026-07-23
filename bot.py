@@ -3,8 +3,9 @@ Binance Spot DEMO bot — STRATEGY=fade (default) | grid | fbb.
 
 Fade (default):
   On each closed 5m bar: if prior 5m pumped >= FADE_PUMP_PCT, arm;
-  if armed and this 5m closed red → market buy.
-  Exit: +FADE_TP_PCT / -FADE_SL_PCT. Max MAX_POSITIONS.
+  if armed and this 5m closed red → filters (retrace/erase/min price) → buy.
+  Exit: +FADE_TP_PCT / -FADE_SL_PCT; optional BE raise after +FADE_BE_ARM_PCT.
+  Max MAX_POSITIONS.
 
 Grid: anchor -step buy / +step TP / -(step*levels) stop.
 FBB: classic Fibonacci Bollinger instant breakout + ladder/trail.
@@ -34,7 +35,11 @@ from strategy import (
     EMA_PERIOD,
     EMA_PROG_MODE,
     EMA_PROGRESSIVE,
+    FADE_BE_ARM_PCT,
+    FADE_BE_LOCK_PCT,
+    FADE_MAX_ERASE_PCT,
     FADE_MIN_PRICE,
+    FADE_MIN_RETRACE_PCT,
     FADE_OHLCV_LIMIT,
     FADE_PUMP_PCT,
     FADE_SL_PCT,
@@ -72,6 +77,8 @@ from strategy import (
     entry_candle_stop_hit,
     entry_rules_met,
     entry_vol_ok,
+    fade_be_should_arm,
+    fade_entry_ok,
     fade_is_red_close,
     fade_pump_pct,
     fade_should_arm,
@@ -131,6 +138,8 @@ class SymbolState:
     vol_fetch_ms: int = 0  # throttle on-demand OHLCV for vol spike
     grid_anchor: float = 0.0  # grid reference price
     fade_armed: bool = False  # saw pump 5m; wait for red 5m close
+    fade_pump_open: float = 0.0
+    fade_pump_high: float = 0.0
     last_fade_5m_ts: int = 0  # last 5m close we evaluated
 
 
@@ -143,6 +152,7 @@ class Position:
     entry_candle_low: float = 0.0
     high_since_entry: float = 0.0
     trail_armed: bool = False
+    fade_be_armed: bool = False
     entry_candle_ts: int = 0
     close_pending: bool = False
     initial_amount: float = 0.0
@@ -210,13 +220,22 @@ class FBBInstantBreakoutBot:
         await self.warmup_all()
         await self._sync_open_positions()
         if STRATEGY == "fade":
+            be_txt = (
+                f"BE +{FADE_BE_ARM_PCT:g}%→+{FADE_BE_LOCK_PCT:g}% | "
+                if FADE_BE_ARM_PCT > 0
+                else ""
+            )
             log.info(
                 "Config: FADE | %s USDT/trade | 5m pump>=%.1f%% then red close | "
-                "TP +%.1f%% / SL -%.1f%% | min_px=%g | max_pos=%d | telegram=%s",
+                "TP +%.1f%% / SL -%.1f%% | retrace>=%.1f%% erase<=%.1f%% | "
+                "%smin_px=%g | max_pos=%d | telegram=%s",
                 ORDER_USDT,
                 FADE_PUMP_PCT,
                 FADE_TP_PCT,
                 FADE_SL_PCT,
+                FADE_MIN_RETRACE_PCT,
+                FADE_MAX_ERASE_PCT,
+                be_txt,
                 FADE_MIN_PRICE,
                 MAX_POSITIONS,
                 "ON" if telegram_enabled() else "OFF",
@@ -779,18 +798,31 @@ class FBBInstantBreakoutBot:
 
             if fade_should_arm(po, ph):
                 state.fade_armed = True
+                state.fade_pump_open = po
+                state.fade_pump_high = ph
                 log.info(
-                    "FADE ARM %s | prev5m pump=%.2f%% (need %.1f%%)",
+                    "FADE ARM %s | prev5m pump=%.2f%% (need %.1f%%) | hi=%.6f",
                     sym,
                     fade_pump_pct(po, ph),
                     FADE_PUMP_PCT,
+                    ph,
                 )
 
             if not state.fade_armed or not fade_is_red_close(co, cc):
                 continue
-            if FADE_MIN_PRICE > 0 and cc < FADE_MIN_PRICE:
+
+            ok_entry, skip = fade_entry_ok(
+                cc, state.fade_pump_open, state.fade_pump_high
+            )
+            if not ok_entry:
+                # retrace too shallow → keep armed; erase/min_price → disarm
+                if skip.startswith("retrace"):
+                    log.info("FADE WAIT %s | %s", sym, skip)
+                    continue
                 state.fade_armed = False
-                log.info("FADE SKIP %s | price %.8f < min %g", sym, cc, FADE_MIN_PRICE)
+                state.fade_pump_open = 0.0
+                state.fade_pump_high = 0.0
+                log.info("FADE SKIP %s | %s", sym, skip)
                 continue
 
             async with self._trade_lock:
@@ -812,6 +844,8 @@ class FBBInstantBreakoutBot:
                 )
                 if ok:
                     state.fade_armed = False
+                    state.fade_pump_open = 0.0
+                    state.fade_pump_high = 0.0
                 else:
                     log.warning("FADE buy failed %s", sym)
 
@@ -829,25 +863,45 @@ class FBBInstantBreakoutBot:
 
         lo = bar_low if bar_low is not None and bar_low > 0 else price
         hi = bar_high if bar_high is not None and bar_high > 0 else price
+        pos.high_since_entry = max(pos.high_since_entry, hi, price)
 
-        hit_sl, _ = fade_sl_hit(lo, pos.entry_price)
+        if not pos.fade_be_armed and fade_be_should_arm(
+            pos.entry_price, pos.high_since_entry
+        ):
+            pos.fade_be_armed = True
+            log.info(
+                "FADE BE ARM %s | MFE touched +%.1f%% → stop @ +%.1f%%",
+                symbol,
+                FADE_BE_ARM_PCT,
+                FADE_BE_LOCK_PCT,
+            )
+
+        hit_sl, _ = fade_sl_hit(
+            lo,
+            pos.entry_price,
+            be_armed=pos.fade_be_armed,
+            be_lock_pct=FADE_BE_LOCK_PCT,
+        )
         hit_tp, _ = fade_tp_hit(hi, pos.entry_price)
         if not hit_tp and not hit_sl:
-            # also check last price
             hit_tp, _ = fade_tp_hit(price, pos.entry_price)
-            hit_sl, _ = fade_sl_hit(price, pos.entry_price)
+            hit_sl, _ = fade_sl_hit(
+                price,
+                pos.entry_price,
+                be_armed=pos.fade_be_armed,
+                be_lock_pct=FADE_BE_LOCK_PCT,
+            )
         if not hit_tp and not hit_sl:
             return
 
-        reason = (
-            f"fade TP +{FADE_TP_PCT:g}%"
-            if hit_tp and not hit_sl
-            else f"fade SL -{FADE_SL_PCT:g}%"
-        )
-        # if both touched in same bar, SL first (safer)
+        # if both touched in same bar, SL/BE first (safer)
         if hit_sl:
-            reason = f"fade SL -{FADE_SL_PCT:g}%"
-        elif hit_tp:
+            reason = (
+                f"fade BE +{FADE_BE_LOCK_PCT:g}%"
+                if pos.fade_be_armed
+                else f"fade SL -{FADE_SL_PCT:g}%"
+            )
+        else:
             reason = f"fade TP +{FADE_TP_PCT:g}%"
 
         pos.close_pending = True
@@ -868,6 +922,8 @@ class FBBInstantBreakoutBot:
             state = self.states.get(symbol)
             if state is not None:
                 state.fade_armed = False
+                state.fade_pump_open = 0.0
+                state.fade_pump_high = 0.0
 
     async def _maybe_grid_enter(self, state: SymbolState, price: float) -> None:
         if state.symbol in self.held_symbols or price <= 0:
@@ -1254,6 +1310,8 @@ class FBBInstantBreakoutBot:
         if state is not None:
             state.entry_armed = False
             state.fade_armed = False
+            state.fade_pump_open = 0.0
+            state.fade_pump_high = 0.0
             if not keep_broke_red:
                 state.broke_red = False
         log.info(
